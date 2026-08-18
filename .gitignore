@@ -482,3 +482,39 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# ============================================================
+# Pipeline Edge en Python (edge/) y entrenamiento (training/)
+# ============================================================
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+ENV/
+
+# Artefactos de compilación/cache de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Secretos y config local — solo edge/config.example.yaml se versiona, config.yaml real no
+edge/config.yaml
+.env
+
+# Estado en tiempo de ejecución del pipeline Edge (se genera solo al correrlo, no es código)
+edge/buffer.db
+edge/captured_plates/
+
+# Pesos de modelo (binarios grandes) — no se versionan en git; cada quien los descarga/entrena
+# por su cuenta (ver ImplementersGuide.md §10). edge/models/PLACEHOLDER.txt sí se versiona.
+edge/models/*.pt
+edge/models/*.onnx
+edge/models/*.engine
+
+# training/ es solo scratch para descargar datasets de Roboflow y correr "yolo detect train" —
+# datasets, checkpoints y logs de entrenamiento no van al repo (pueden pesar varios GB).
+training/

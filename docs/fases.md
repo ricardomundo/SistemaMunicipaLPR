@@ -79,15 +79,20 @@
 - Diseño y uso detallados en [ImplementersGuide.md §9](ImplementersGuide.md#9-herramientas-de-prueba-toolsverifyfase2-y-toolsloadsimulator).
 
 **Entregado — pipeline Edge, `edge/` (Python):**
-- Captura con OpenCV (con ráfaga + selección por nitidez para mitigar motion blur a 160 km/h), detección de placa con YOLO (ultralytics), OCR con EasyOCR, selección por confianza, y publish de `PlateReadEvent` directo a RabbitMQ (cola `plate-read-event.raw`) — sin pasar por CAP, igual que el lado .NET.
+- Captura con OpenCV (con ráfaga + selección por nitidez para mitigar motion blur a 160 km/h), detección de placa con YOLO (ultralytics), OCR con PaddleOCR (con corrección de ángulo y un margen configurable alrededor del bbox antes de leer el texto), selección por confianza (con un filtro opcional por formato de placa vía regex, apagado por default), y publish de `PlateReadEvent` directo a RabbitMQ (cola `plate-read-event.raw`) — sin pasar por CAP, igual que el lado .NET.
 - Buffer local en SQLite + hilo de drenado en background para tolerancia a cortes de red.
 - Diseño y uso detallados en [ImplementersGuide.md §10](ImplementersGuide.md#10-pipeline-edge-python--edge).
 
-**Pendiente:**
-- Confirmar bajo carga sostenida que la latencia cámara→alerta se mantiene dentro del presupuesto de <300ms (con `tools/LoadSimulator`).
-- Conseguir o entrenar un modelo YOLO de detección de placas — el pipeline Edge no incluye uno todavía, y sin él no detecta nada real.
-- Probar el pipeline Edge contra una cámara real (o stream RTSP) y RabbitMQ real; hoy solo está validado de forma aislada (config, serialización del evento, buffer, manejo de caída de conexión), no contra hardware.
-- Diseñar el uploader de imágenes de placa hacia un storage central (hoy solo se guardan en disco local del nodo Edge).
+**En progreso — modelo de detección de placas:** el pipeline Edge no incluye un modelo todavía. Se está preparando uno propio para placas mexicanas: dataset "full-plate-dataset" (workspace `cv-0zohq` en Roboflow, versión 1) descargado en formato YOLOv8 vía `roboflow` a una carpeta `training/` (fuera de `edge/`, que es solo el runtime), para entrenar con `ultralytics` (`yolo detect train ... model=yolov8n.pt`) y copiar el resultado (`best.pt`) a `edge/models/plate_detector.pt`.
+
+**Para retomar:**
+1. **Primero** buscar si ya existe un modelo de detección de placas pre-entrenado y descargable (pestaña "Deploy"/"Model" del proyecto en Roboflow, o algún repo público con pesos `.pt` ya listos) — evita el entrenamiento si algo así sirve tal cual. `full-plate-dataset` (lo que ya se descargó) es un **dataset** (imágenes + etiquetas), no pesos entrenados — solo sirve como insumo para entrenar, no como atajo.
+2. Si no aparece nada usable ya entrenado: confirmar que la descarga del dataset (`training/download_dataset.py`) terminó bien y revisar el `data.yaml` generado (nombre de la(s) clase(s), cantidad de imágenes), luego entrenar con `ultralytics` (`yolo detect train data=... model=yolov8n.pt epochs=100 imgsz=640 batch=16`) y copiar `runs/detect/train/weights/best.pt` a `edge/models/plate_detector.pt`.
+3. Configurar `edge/config.yaml` (copiado de `config.example.yaml`) y correr `python -m src.main` contra una cámara/video de prueba con el stack de `docker-compose.yml` arriba — primera vez que el pipeline Edge corre de punta a punta contra hardware/modelo real.
+4. Confirmar que `dotnet build` de la solución completa (incluyendo `tools/VerifyFase2`, `tools/LoadSimulator` y `src/Service.Inference`) compila limpio tras el fix de la API async de RabbitMQ.Client 7.x — se corrigió pero no se confirmó una recompilación exitosa después del último ajuste.
+5. Con el build confirmado, volver a correr `tools/LoadSimulator` para validar por fin la latencia cámara→alerta bajo carga (<300ms) — el objetivo original de esta mitad de Fase 3, todavía sin confirmar.
+6. Diseñar el uploader de imágenes de placa hacia un storage central (hoy solo se guardan en disco local del nodo Edge).
+7. Rotar la API key de Roboflow usada para descargar el dataset (quedó expuesta en texto plano durante esta sesión de trabajo).
 
 ---
 
