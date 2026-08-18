@@ -1,0 +1,13 @@
+Coloca aquí los pesos del modelo YOLO de detección de placas (por ejemplo: plate_detector.pt).
+
+Este repo NO incluye un modelo entrenado. Un YOLOv8/v11 preentrenado en COCO (el que trae
+"ultralytics" por default) no tiene una clase de "placa" y no va a detectar nada útil aquí.
+
+Opciones:
+  1. Buscar un modelo público de detección de placas ya entrenado (hay varios en Hugging Face /
+     Roboflow, entrenados sobre datasets tipo OpenALPR o CCPD) y colocar su archivo .pt en esta
+     carpeta.
+  2. Entrenar uno propio con ultralytics sobre un dataset de placas etiquetado (idealmente con
+     ejemplos de las cámaras/ángulos/velocidades reales de este proyecto).
+
+Ver ImplementersGuide.md §10 para más contexto.

@@ -78,10 +78,16 @@
 - Mide throughput de publish y latencia real cámara→alerta sobre una fracción configurable de lecturas que generan match, correlacionando por `EventId`.
 - Diseño y uso detallados en [ImplementersGuide.md §9](ImplementersGuide.md#9-herramientas-de-prueba-toolsverifyfase2-y-toolsloadsimulator).
 
+**Entregado — pipeline Edge, `edge/` (Python):**
+- Captura con OpenCV (con ráfaga + selección por nitidez para mitigar motion blur a 160 km/h), detección de placa con YOLO (ultralytics), OCR con EasyOCR, selección por confianza, y publish de `PlateReadEvent` directo a RabbitMQ (cola `plate-read-event.raw`) — sin pasar por CAP, igual que el lado .NET.
+- Buffer local en SQLite + hilo de drenado en background para tolerancia a cortes de red.
+- Diseño y uso detallados en [ImplementersGuide.md §10](ImplementersGuide.md#10-pipeline-edge-python--edge).
+
 **Pendiente:**
-- Confirmar bajo carga sostenida que la latencia cámara→alerta se mantiene dentro del presupuesto de <300ms.
-- Pipeline Edge en Python: OpenCV (captura con burst de frames para mitigar motion blur a 160 km/h) → YOLOv8/v11 (detección de placa) → EasyOCR → selección por confianza → publish de `PlateReadEvent` directo a RabbitMQ (cola `plate-read-event.raw`, ver [ArchitectureGuide.md §3](ArchitectureGuide.md#3-arquitectura-de-eventos-y-mensajería)).
-- Buffer SQLite local en el nodo Edge + uploader en background para tolerancia a cortes de red.
+- Confirmar bajo carga sostenida que la latencia cámara→alerta se mantiene dentro del presupuesto de <300ms (con `tools/LoadSimulator`).
+- Conseguir o entrenar un modelo YOLO de detección de placas — el pipeline Edge no incluye uno todavía, y sin él no detecta nada real.
+- Probar el pipeline Edge contra una cámara real (o stream RTSP) y RabbitMQ real; hoy solo está validado de forma aislada (config, serialización del evento, buffer, manejo de caída de conexión), no contra hardware.
+- Diseñar el uploader de imágenes de placa hacia un storage central (hoy solo se guardan en disco local del nodo Edge).
 
 ---
 

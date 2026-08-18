@@ -167,3 +167,47 @@ dotnet build
 **Por qué solo se mide latencia del 1% con match:** con `PlateReadLogging:OnlyLogMatches=true` (default), el resto de las lecturas nunca tocan SQL — para esas, lo relevante es que RabbitMQ no acumule backlog (visible en `http://localhost:15672`), una métrica de throughput distinta que hay que revisar a mano durante el `run`.
 
 **Nota sobre el outbox de CAP bajo carga sintética:** este tool sigue usando CAP (con `UseSqlServer`) para su propio suscriptor de `BlacklistHitSavedEvent` — a la escala de eventos de blacklist (1% del tráfico) esto no genera carga significativa en `cap.Published`/`cap.Received`. Si se aumenta mucho `--match-ratio`, considerar limpiar esas tablas manualmente de vez en cuando (`cleanup` no las toca).
+
+## 10. Pipeline Edge (Python) — `edge/`
+
+Proceso Python independiente del backend .NET — corre en el nodo Edge junto a cada cámara física (un Jetson Orin Nano u otro PC por instalación, ver [ArchitectureGuide.md §6](ArchitectureGuide.md#6-stack-tecnológico)). Un proceso = una cámara. Estructura:
+
+```
+edge/
+  requirements.txt
+  config.example.yaml      # copiar a config.yaml y ajustar
+  models/                  # colocar aquí el .pt del detector de placas (ver nota abajo)
+  src/
+    config.py              # carga y valida config.yaml
+    events.py               # PlateReadEvent — espejo exacto del record de Core.Contracts
+    capture.py               # OpenCV: lectura de frames + ráfaga/selección por nitidez
+    detector.py               # YOLO (ultralytics): detección de la placa en el frame
+    ocr.py                     # PaddleOCR: texto + confianza a partir del recorte de la placa
+    buffer.py                   # cola local SQLite para tolerancia a cortes de red
+    publisher.py                 # publish AMQP directo (pika) a la cola cruda de RabbitMQ
+    main.py                       # orquesta el loop completo
+```
+
+**Instalación y ejecución:**
+```bash
+cd edge
+cp config.example.yaml config.yaml   # ajustar camera.id, camera.source, credenciales de RabbitMQ, etc.
+pip install -r requirements.txt
+python -m src.main
+```
+
+**Flujo por frame:** se lee un frame de la cámara (con `frame_skip` para no correr el detector en cada frame); si YOLO detecta una placa por encima de `detector.min_confidence`, se capturan `burst_size` frames adicionales en rápida sucesión y se elige el más nítido (mayor varianza del Laplaciano) antes de recortar (con un margen de `detector.crop_padding` píxeles alrededor del bbox, para no cortar el borde de algún carácter) — mitigación de motion blur a velocidades altas, el riesgo específico que señala [ArchitectureGuide.md §1](ArchitectureGuide.md#1-visión-general) para avenidas de hasta 160 km/h. Sobre ese recorte nítido corre PaddleOCR (con corrección de ángulo, `use_angle_cls=True` — útil para placas fotografiadas en ángulo desde el arco/avenida); si la confianza del texto reconocido supera `ocr.min_confidence` (y, opcionalmente, si coincide con `ocr.plate_pattern` cuando ese filtro está activo), se arma el `PlateReadEvent` y se intenta publicar. Un cooldown por placa (`plate_cooldown_seconds`) evita publicar el mismo vehículo varias veces mientras cruza el campo de visión de la cámara.
+
+**Por qué PaddleOCR y no EasyOCR:** mismo alfabeto latino A-Z0-9 para placas mexicanas — no hay diferencia real de "idioma" entre ambos motores para este caso. Se eligió PaddleOCR por su tolerancia reportada a ruido/blur en video de vigilancia. Costo real a tener en cuenta: el proceso Edge ahora carga dos frameworks de ML distintos en memoria (PyTorch vía `ultralytics` para el detector, PaddlePaddle vía `paddleocr` para el texto) — más huella de RAM/disco en el Jetson que si ambas etapas compartieran framework. Si eso resulta un problema en hardware real, `ocr.py` es la única pieza que habría que volver a cambiar (misma interfaz pública `PlateOcr.read()`, así que el resto del pipeline no se ve afectado). `requirements.txt` fija `paddleocr<3` a propósito — la serie 3.x reescribió buena parte de la API pública (`.predict()` en vez de `.ocr()`), y este código está escrito contra la clásica 2.x, sin poder verificar contra el paquete real instalado (sin acceso a PyPI desde donde se escribió).
+
+**Modelo de detección de placas:** no se entrena uno desde cero — busca en Roboflow Universe (`universe.roboflow.com`) proyectos públicos de "license plate detection", descarga los pesos `.pt` y pruébalos directo contra tus cámaras antes de pensar en afinar/entrenar algo propio. Detectar dónde está una placa depende poco del país (es un rectángulo con cierta proporción); lo que sí es específico de México (colores/diseños por estado, formato de dos líneas en motos) importa más si decides afinar el modelo con tus propios datos más adelante que para el intento inicial con un modelo público.
+
+**Publish:** igual que el lado .NET, `PlateReadEvent` viaja como JSON plano (AMQP puro, vía `pika`) a la cola durable `plate-read-event.raw` — sin ningún envelope de CAP que replicar (esa es la simplificación que dejó el cambio de diseño de Fase 3, ver [ArchitectureGuide.md §3](ArchitectureGuide.md#3-arquitectura-de-eventos-y-mensajería)). Los nombres de campo del JSON (`events.py`) deben coincidir EXACTO en casing con el record de C# — `System.Text.Json` deserializa sin `PropertyNameCaseInsensitive`.
+
+**Tolerancia a cortes de red:** si el publish directo falla, el evento se guarda en un buffer local SQLite (`buffer.db`) en vez de perderse; un hilo de fondo lo drena hacia RabbitMQ en cuanto la conexión vuelve, en el mismo orden en que se generaron los eventos.
+
+**Gaps conocidos, sin resolver todavía:**
+- **No incluye un modelo de detección de placas.** Un YOLO preentrenado en COCO no tiene clase de "placa" — hace falta conseguir un modelo público ya entrenado para esto o entrenar uno propio, y colocarlo en `edge/models/`. Sin ese archivo, `main.py` se niega a arrancar (falla rápido con un mensaje explícito en vez de correr sin detectar nada).
+- **Sin uploader de imágenes a un storage central.** Los recortes de placa se guardan solo en disco local del nodo Edge (`images.save_dir`); `ImageReference` apunta a esa ruta local. No hay todavía ninguna pieza que suba esas imágenes a un storage accesible desde el backend/dashboard — hace falta diseñarla y construirla antes de que `ImageReference` sea útil fuera del propio nodo Edge.
+- **Despliegue en Jetson:** `pip install ultralytics` en un entorno genérico trae wheels de PyTorch que no aprovechan la GPU del Jetson — en Jetson real hace falta instalar primero el PyTorch específico de NVIDIA para la versión de JetPack instalada (ver comentario en `requirements.txt`).
+- **Sin verificar contra hardware real:** este código se escribió y se probó de forma aislada (config, serialización del evento, buffer SQLite, manejo de fallo de conexión a RabbitMQ) en un entorno sin cámara ni GPU — los módulos de captura/detección/OCR (`capture.py`, `detector.py`, `ocr.py`) no se han ejecutado todavía contra una cámara, un stream RTSP real, ni un modelo de placas entrenado. Primer paso al retomar: conseguir un modelo de detección de placas, conectar una cámara de prueba, y correr `python -m src.main` de punta a punta contra el RabbitMQ real del `docker-compose.yml`.

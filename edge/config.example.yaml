@@ -1,0 +1,58 @@
+# Copia este archivo a config.yaml y ajusta los valores para tu cámara/instalación.
+# Un proceso de este pipeline = una cámara física (un Jetson Orin Nano por arco/avenida, según
+# ArchitectureGuide.md §6).
+
+camera:
+  id: "CAM-TEST-01"        # DEBE coincidir exacto con Camaras.Codigo en SQL Server (tabla sembrada por Fase 1/tools de prueba)
+  source: 0                 # índice de dispositivo local (0 = primera cámara USB), o URL RTSP: "rtsp://usuario:pass@host:554/stream1"
+  frame_skip: 2              # procesar 1 de cada N frames del stream (baja carga de CPU/GPU; súbelo si el detector no da abasto en tiempo real)
+  burst_size: 5               # frames adicionales a capturar en ráfaga al detectar una placa, para elegir el más nítido antes del OCR
+  plate_cooldown_seconds: 5   # no volver a publicar la misma placa dentro de esta ventana (evita duplicados del mismo vehículo pasando frente a la cámara)
+
+detector:
+  # Pesos de un modelo YOLO ENTRENADO PARA DETECTAR PLACAS. Un YOLOv8/v11 preentrenado en COCO
+  # (el que se descarga por default con ultralytics) NO tiene una clase de "placa" y no sirve
+  # aquí sin más. Búscalo en Roboflow Universe (universe.roboflow.com) — hay varios proyectos
+  # públicos de "license plate detection" con pesos .pt descargables listos para usar; pruébalo
+  # primero tal cual contra tus propias cámaras antes de pensar en entrenar/afinar uno propio.
+  # Ver ImplementersGuide.md §10 — este repo no incluye pesos, hay que conseguirlos o entrenarlos
+  # aparte y poner el .pt aquí.
+  model_path: "models/plate_detector.pt"
+  min_confidence: 0.4
+  crop_padding: 5   # margen en píxeles alrededor del bbox detectado antes de mandar a OCR — ayuda cuando el detector recorta justo el borde de un carácter
+
+ocr:
+  min_confidence: 0.5   # confianza mínima de PaddleOCR para aceptar el texto leído; por debajo de esto, se descarta la lectura (no se publica)
+  lang: "en"              # PaddleOCR usa un solo idioma/alfabeto por instancia; "en" cubre A-Z/0-9, suficiente para placas mexicanas (sin Ñ ni acentos)
+  # Filtro OPCIONAL por formato de placa (regex sobre el texto ya normalizado, ej. r"^[A-Z0-9]{6,8}$").
+  # Apagado por default (null) — el formato nacional mexicano actual es 3 letras + 3 dígitos
+  # (6 caracteres) desde la unificación 2022, pero durante años van a seguir circulando placas
+  # del formato anterior (varía por estado), motos, remolques y series federales/diplomáticas con
+  # otros largos. Actívalo solo si te interesa reducir ruido de OCR a costa de posibles falsos
+  # negativos en placas de formato atípico — ver la nota en src/ocr.py.
+  plate_pattern: null
+
+rabbitmq:
+  host: "localhost"
+  port: 5672
+  virtual_host: "/"
+  username: "guest"
+  password: "guest"
+  queue: "plate-read-event.raw"   # debe coincidir con Core.Contracts/RawQueues.PlateRead en el backend .NET
+  reconnect_seconds: 5
+
+buffer:
+  # Buffer local SQLite: si RabbitMQ no es alcanzable (corte de red municipal), los eventos se
+  # guardan aquí en vez de perderse, y un hilo de fondo los reintenta publicar en orden cuando
+  # la conexión vuelve. Ver ArchitectureGuide.md §5 (plan de contingencia).
+  sqlite_path: "buffer.db"
+  flush_interval_seconds: 10
+  max_batch_per_flush: 50
+
+images:
+  # Guarda el recorte de la placa detectada en disco local; ImageReference en el evento apunta a
+  # esta ruta relativa. NOTA (gap conocido, ver ImplementersGuide.md): esto es solo
+  # almacenamiento local del nodo Edge — no hay todavía un uploader hacia un storage central
+  # (blob/S3/Azure), así que estas imágenes no llegan al backend ni se pueden consultar desde el
+  # futuro dashboard C4 tal cual. Falta diseñar y construir esa pieza.
+  save_dir: "captured_plates"

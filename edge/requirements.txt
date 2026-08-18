@@ -1,0 +1,27 @@
+# Pipeline Edge (Fase 3) — captura OpenCV + detección YOLO + OCR PaddleOCR + publish RabbitMQ.
+#
+# IMPORTANTE para despliegue en Jetson Orin Nano: "pip install ultralytics" en un PC de
+# escritorio trae los wheels genéricos de PyTorch/torchvision (CPU o CUDA de escritorio), que NO
+# sirven en Jetson — ahí hace falta el wheel de PyTorch compilado por NVIDIA para la versión
+# exacta de JetPack instalada (ver la documentación de NVIDIA para Jetson, "PyTorch for Jetson").
+# Instalar primero ese PyTorch específico de Jetson y DESPUÉS "pip install ultralytics
+# --no-deps" (para que no reinstale un PyTorch incompatible encima), o el detector corre en CPU
+# sin aceleración por GPU (funciona, pero muy por debajo del framerate necesario a 160 km/h).
+#
+# PaddleOCR trae su propio framework (PaddlePaddle) — en Jetson pasa lo mismo que con PyTorch:
+# el wheel genérico de "paddlepaddle" no está compilado para esa arquitectura/GPU, hace falta el
+# de NVIDIA/Paddle para Jetson, o queda corriendo en CPU. Nota aparte: esto significa que el
+# proceso Edge ahora carga DOS frameworks de ML (PyTorch para el detector, PaddlePaddle para el
+# OCR) — más RAM/disco que si ambas etapas compartieran uno solo. Ver la nota completa en
+# src/ocr.py si esto es un problema en tu hardware real.
+#
+# paddleocr está fijado a <3 a propósito: la serie 3.x reescribió buena parte de la API pública
+# (.predict() en vez de .ocr()) — este código está escrito contra la API clásica 2.x, que no se
+# pudo verificar contra el paquete real instalado (sin acceso a PyPI desde este entorno).
+opencv-python>=4.9,<5
+ultralytics>=8.2,<9
+paddleocr>=2.7,<3
+paddlepaddle>=2.5,<3
+pika>=1.3,<2
+PyYAML>=6.0,<7
+numpy>=1.26,<2

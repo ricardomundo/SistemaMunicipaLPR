@@ -11,9 +11,10 @@ src/
   Core.Domain/         Entidades del dominio (POCOs), sin dependencia de EF Core
   Service.Inference/  Worker Service — consumers de CAP/RabbitMQ + cache de Redis
   Api.Web/            Web API + Auth + SignalR + AlertNotificationConsumer
+edge/                 Pipeline Edge en Python (captura OpenCV + detección YOLO + OCR EasyOCR + publish RabbitMQ) — proceso independiente, uno por cámara física
 ```
 
-Referencias de proyecto: `Service.Inference` → `Core.Contracts`, `Core.Domain`. `Api.Web` → `Core.Contracts`, `Core.Domain`.
+Referencias de proyecto: `Service.Inference` → `Core.Contracts`, `Core.Domain`. `Api.Web` → `Core.Contracts`, `Core.Domain`. `edge/` no depende del backend .NET — se comunica con él únicamente publicando `PlateReadEvent` como JSON plano por AMQP a la cola `plate-read-event.raw` (ver §3 e [ImplementersGuide.md §10](ImplementersGuide.md#10-pipeline-edge-python--edge)).
 
 ## 2. Infraestructura (`docker-compose.yml`)
 
@@ -133,7 +134,7 @@ Los paquetes `DotNetCore.CAP*` están fijados a `Version="8.*"`. `RabbitMQ.Clien
 - [x] Consumers de `PlateReadEvent` (RabbitMQ.Client directo), `BlacklistHitPersistenceConsumer` (Dapper, vía CAP), `AlertNotificationConsumer` (vía CAP) — Fase 2
 - [x] `AlertHub` (SignalR) — Fase 2
 - [x] Simulador de carga (`tools/LoadSimulator`, 50 cámaras × 10 lecturas/seg) — Fase 3
-- [ ] Pipeline Edge Python (YOLO + OpenCV + EasyOCR + buffer SQLite) — Fase 3
+- [ ] Pipeline Edge Python (YOLO + OpenCV + EasyOCR + buffer SQLite) — Fase 3, código construido y validado de forma aislada; sin modelo de detección de placas ni prueba contra cámara real todavía (ver [ImplementersGuide.md §10](ImplementersGuide.md#10-pipeline-edge-python--edge))
 - [ ] Frontend C4 (React/Angular + mapa ESRI/Google Maps) — no iniciado
 
 > Fase 0, Pre-Fase 1, Fase 1 y Fase 2 están verificadas de punta a punta contra servicios reales (ver `fases.md`). El siguiente trabajo real es completar Fase 3.
