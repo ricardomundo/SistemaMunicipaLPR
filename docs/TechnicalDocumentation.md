@@ -7,10 +7,10 @@
 ```
 SistemaLPR.sln
 src/
-  Core.Contracts/     Contratos de eventos (MassTransit), sin dependencias de infraestructura
+  Core.Contracts/     Contratos de eventos + EventTopics (DotNetCore.CAP), sin dependencias de infraestructura
   Core.Domain/         Entidades del dominio (POCOs), sin dependencia de EF Core
-  Service.Inference/  Worker Service — consumer de RabbitMQ (Fase 2, aún no implementado)
-  Api.Web/            Web API + Auth + SignalR (Fase 2/3 para el Hub)
+  Service.Inference/  Worker Service — suscriptores de CAP/RabbitMQ + cache de Redis (Fase 2, implementado y verificado)
+  Api.Web/            Web API + Auth + SignalR + AlertNotificationConsumer (Fase 2, implementado y verificado)
 ```
 
 Referencias de proyecto: `Service.Inference` → `Core.Contracts`, `Core.Domain`. `Api.Web` → `Core.Contracts`, `Core.Domain`.
@@ -56,7 +56,7 @@ public sealed record BlacklistEntryRemovedEvent
 }
 ```
 
-Ninguno de estos eventos tiene todavía un `Consumer` de MassTransit implementado — corresponde a Fase 2.
+Cada evento se publica/consume por nombre de topic vía DotNetCore.CAP, no por tipo .NET — las constantes de topic viven en `Core.Contracts/EventTopics.cs` (`PlateRead`, `BlacklistHitSaved`, `BlacklistEntryAdded`, `BlacklistEntryRemoved`). Los suscriptores (`ICapSubscribe`) están implementados y verificados end-to-end desde Fase 2 — ver §7 y [fases.md](fases.md).
 
 ## 4. Modelo de datos (`Core.Domain` + `Api.Web/Data/LprDbContext.cs`)
 
@@ -66,7 +66,7 @@ Base de datos única: `SistemaLPR` (connection string `SistemaLPR` en `appsettin
 |---|---|---|
 | `Camaras` | `Id` (PK identity), `Codigo` (único), `Nombre`, `Ubicacion` (`geography`, SRID 4326), `TipoInstalacion` (string: `ArcoSeguridad`\|`AvenidaAltaVelocidad`), `VelocidadMaximaKmh`, `Activa`, `CreatedAtUtc` | `Ubicacion` mapea `NetTopologySuite.Geometries.Point` — mismo sistema de coordenadas que ESRI/Google Maps |
 | `VehiculosRobados` | `Id`, `PlateText` (indexado), `NumeroReporte`, `Estado` (`Activo`\|`Recuperado`), `FechaReporteUtc`, `CreatedAtUtc`, `RecuperadoAtUtc` | Fuente de verdad de la Lista Negra; Redis solo cachea `PlateText` |
-| `LecturasHistoricas` | `Id` (bigint PK), `EventId` (único), `PlateText`, `CamaraId` (FK), `TimestampUtc` (indexado), `Confidence`, `ImageReference`, `EsCoincidenciaBlacklist` | Append-only. **Índice columnstore no clusterizado** `IX_LecturasHistoricas_Columnstore` sobre `(PlateText, CamaraId, TimestampUtc, Confidence, EsCoincidenciaBlacklist)` para consultas forenses/analíticas — agregado a mano vía `migrationBuilder.Sql()` en la migración `InitialLprSchema`, ya que EF Core no expone una API fluida nativa para columnstore |
+| `LecturasHistoricas` | `Id` (bigint PK), `EventId` (único), `PlateText`, `CamaraId` (FK), `TimestampUtc` (indexado), `Confidence`, `ImageReference`, `EsCoincidenciaBlacklist` | Append-only. **Por default solo se registran lecturas que coinciden con la blacklist** (`EsCoincidenciaBlacklist = 1`) — no se guarda cada lectura, para no acumular información innecesaria. Configurable vía `PlateReadLogging:OnlyLogMatches` en `appsettings.json` de `Service.Inference` (default `true`); en `false`, también se registran las lecturas sin match (`EsCoincidenciaBlacklist = 0`). Ver `Service.Inference/Consumers/PlateReadConsumer.cs` y [fases.md — Fase 2](fases.md). **Índice columnstore no clusterizado** `IX_LecturasHistoricas_Columnstore` sobre `(PlateText, CamaraId, TimestampUtc, Confidence, EsCoincidenciaBlacklist)` para consultas forenses/analíticas — agregado a mano vía `migrationBuilder.Sql()` en la migración `InitialLprSchema`, ya que EF Core no expone una API fluida nativa para columnstore |
 | `Alertas` | `Id` (bigint PK), `LecturaHistoricaId` (FK), `VehiculoRobadoId` (FK), `TimestampUtc`, `Estado` (`Pendiente`\|`Atendida`\|`Descartada`), `AtendidaPor`, `AtendidaAtUtc` | El único campo mutable tras la creación es el flujo de atención (`Estado`/`AtendidaPor`/`AtendidaAtUtc`); el resto del registro es inmutable |
 
 Migración: `src/Api.Web/Migrations/20260817195921_InitialLprSchema.cs`.
@@ -118,8 +118,10 @@ Todos los proyectos apuntan a `net9.0`. Varios paquetes de Microsoft (`EntityFra
 | Proyecto | Paquetes clave |
 |---|---|
 | `Core.Domain` | `NetTopologySuite` |
-| `Service.Inference` | `MassTransit.RabbitMQ`, `StackExchange.Redis`, `Dapper`, `Microsoft.Data.SqlClient` |
-| `Api.Web` | `MassTransit.RabbitMQ`, `StackExchange.Redis`, `Dapper`, `Microsoft.EntityFrameworkCore.SqlServer` (9.0.19), `Microsoft.EntityFrameworkCore.SqlServer.NetTopologySuite` (9.0.19), `Microsoft.EntityFrameworkCore.Design`/`.Tools` (9.0.19), `Microsoft.AspNetCore.SignalR.StackExchangeRedis` (9.0.19), `Microsoft.AspNetCore.Authentication.JwtBearer` (9.0.19), `Casbin.NET`, `Casbin.NET.Adapter.EFCore` |
+| `Service.Inference` | `DotNetCore.CAP`, `DotNetCore.CAP.RabbitMQ`, `DotNetCore.CAP.SqlServer`, `StackExchange.Redis`, `Dapper`, `Microsoft.Data.SqlClient` |
+| `Api.Web` | `DotNetCore.CAP`, `DotNetCore.CAP.RabbitMQ`, `DotNetCore.CAP.SqlServer`, `StackExchange.Redis`, `Dapper`, `Microsoft.EntityFrameworkCore.SqlServer` (9.0.19), `Microsoft.EntityFrameworkCore.SqlServer.NetTopologySuite` (9.0.19), `Microsoft.EntityFrameworkCore.Design`/`.Tools` (9.0.19), `Microsoft.AspNetCore.SignalR.StackExchangeRedis` (9.0.19), `Microsoft.AspNetCore.Authentication.JwtBearer` (9.0.19), `Casbin.NET`, `Casbin.NET.Adapter.EFCore` |
+
+> **Nota (2026-08-18):** Fase 2 se construyó originalmente sobre `MassTransit.RabbitMQ`, pero se reemplazó por `DotNetCore.CAP` porque MassTransit 9.x exige configurar una licencia (`SetLicense`/`MT_LICENSE`) incluso para uso local — ver [ImplementersGuide.md §8](ImplementersGuide.md#8-notas-operativas-conocidas) para el detalle completo de la migración. Los paquetes `DotNetCore.CAP*` están fijados a `Version="8.*"` (flotante, sin confirmar el patch exacto).
 
 ## 7. Estado real de implementación (checklist técnico)
 
@@ -127,11 +129,11 @@ Todos los proyectos apuntan a `net9.0`. Varios paquetes de Microsoft (`EntityFra
 - [x] Autenticación JWT/Keycloak + autorización Casbin.NET, con seeding de políticas
 - [x] Contratos de eventos (`Core.Contracts`)
 - [x] Entidades + `LprDbContext` + migración inicial con índice columnstore (`Core.Domain`, Fase 1)
-- [ ] `BlacklistCacheService` (carga inicial + invalidación event-driven + refresco delta) — Fase 2
-- [ ] Consumers de MassTransit (`PlateReadConsumer`, persistencia de `LecturaHistorica`/`Alerta` vía Dapper) — Fase 2
-- [ ] `AlertHub` (SignalR) — Fase 2/3
+- [x] `BlacklistCacheService` (carga inicial + invalidación event-driven + refresco delta) — Fase 2, verificado end-to-end
+- [x] Suscriptores de DotNetCore.CAP (`PlateReadConsumer`, `BlacklistHitPersistenceConsumer` vía Dapper, `AlertNotificationConsumer`) — Fase 2, verificado end-to-end (migrados de MassTransit el 2026-08-18)
+- [x] `AlertHub` (SignalR) — Fase 2, verificado end-to-end
 - [ ] Simulador de carga (50 cámaras × 10 lecturas/seg) — Fase 3
 - [ ] Pipeline Edge Python (YOLO + OpenCV + EasyOCR + buffer SQLite) — Fase 3
 - [ ] Frontend C4 (React/Angular + mapa ESRI/Google Maps) — no iniciado
 
-> No verificado de punta a punta: este entorno de desarrollo no tuvo Docker disponible durante la implementación. Confirmar localmente antes de considerar Fase 1 cerrada al 100%.
+> Fase 0, Pre-Fase 1, Fase 1 y Fase 2 ya están verificadas de punta a punta contra servicios reales (ver `fases.md`). El siguiente trabajo real es Fase 3.

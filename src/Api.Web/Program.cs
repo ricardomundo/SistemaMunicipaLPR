@@ -1,7 +1,9 @@
 using System.Security.Claims;
 using System.Text.Json;
 using Api.Web.Authorization;
+using Api.Web.Consumers;
 using Api.Web.Data;
+using Api.Web.Hubs;
 using Casbin;
 using Casbin.Persist;
 using Casbin.Persist.Adapter.EFCore;
@@ -106,15 +108,59 @@ builder.Services.AddAuthorization(options =>
     options.AddPolicy("Casbin", policy => policy.Requirements.Add(new CasbinRequirement()));
 });
 
+// --- Fase 2: SignalR (AlertHub) con backplane de Redis, para escalar el push de alertas a
+// más de una instancia de Api.Web ---
+var redisConnectionString = builder.Configuration["Redis:ConnectionString"] ?? "localhost:6379";
+builder.Services
+    .AddSignalR()
+    .AddStackExchangeRedis(redisConnectionString);
+
+// --- Fase 2: DotNetCore.CAP/RabbitMQ (reemplaza a MassTransit — ver ImplementersGuide.md §8
+// para el porqué). AlertNotificationConsumer se suscribe a "blacklist-hit-saved-event" con su
+// propio DefaultGroupName ("api-web"), independiente del grupo de Service.Inference, así que
+// ambos reciben su propia copia del mensaje y la empuja por SignalR a AlertHub sin esperar a
+// que la persistencia (en Service.Inference) termine ---
+builder.Services.AddTransient<AlertNotificationConsumer>();
+
+builder.Services.AddCap(x =>
+{
+    // CAP usa la misma base "SistemaLPR" para su propio outbox transaccional (tablas
+    // cap.Published / cap.Received, creadas automáticamente al arrancar) — no choca con el
+    // esquema de LprDbContext ni con casbin_rule.
+    x.UseSqlServer(sqlConnectionString!);
+
+    var rabbitMq = builder.Configuration.GetSection("RabbitMq");
+    x.UseRabbitMQ(o =>
+    {
+        o.HostName = rabbitMq["Host"] ?? "localhost";
+        o.VirtualHost = rabbitMq["VirtualHost"] ?? "/";
+        o.UserName = rabbitMq["Username"] ?? "guest";
+        o.Password = rabbitMq["Password"] ?? "guest";
+    });
+
+    x.DefaultGroupName = "api-web";
+});
+
 var app = builder.Build();
 
 // Apply pending domain migrations, create the Casbin policy table (Casbin ships no
 // migrations of its own — EnsureCreated is the adapter's documented setup path), and seed
 // the baseline role -> permission matrix. All three are safe to run on every startup.
+//
+// Order matters here: CasbinDbContext<int>.Database.EnsureCreated() only creates its own
+// schema when the physical database has ZERO tables. It shares the "SistemaLPR" database
+// with LprDbContext (see appsettings.json), so if LprDbContext's migration ran first and
+// created Camaras/VehiculosRobados/etc., EnsureCreated() sees "this database already has
+// tables" and silently skips creating "casbin_rule" — the app then crashes the moment
+// Casbin tries to load policies (SqlException: Invalid object name 'casbin_rule'). Running
+// EnsureCreated() first, while the database is still empty, avoids that trap. Confirmed
+// during Fase 1 end-to-end verification (2026-08-18) — see ImplementersGuide.md §8. Note:
+// on a database that was already bootstrapped in the old order, swapping this order alone
+// will NOT retroactively fix it; the SQL Server volume needs to be reset once.
 using (var scope = app.Services.CreateScope())
 {
-    scope.ServiceProvider.GetRequiredService<LprDbContext>().Database.Migrate();
     scope.ServiceProvider.GetRequiredService<CasbinDbContext<int>>().Database.EnsureCreated();
+    scope.ServiceProvider.GetRequiredService<LprDbContext>().Database.Migrate();
 
     var enforcer = scope.ServiceProvider.GetRequiredService<IEnforcer>();
     enforcer.SeedDefaultPolicies();
@@ -132,5 +178,6 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
+app.MapHub<AlertHub>("/hubs/alerts");
 
 app.Run();

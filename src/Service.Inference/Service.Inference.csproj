@@ -8,8 +8,15 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Fase 2 migró de MassTransit a DotNetCore.CAP (2026-08-18): MassTransit 9.x exige
+         SetLicense/MT_LICENSE incluso para uso local, y bajar a 8.x resultaba en depender de
+         una serie sin soporte activo del proyecto. CAP es MIT, sin licencia comercial, y usa
+         un patrón de outbox transaccional (tabla cap.Published en la misma base de datos)
+         en vez de publicar directo al bus — ver ImplementersGuide.md §8. -->
     <PackageReference Include="Dapper" Version="2.1.79" />
-    <PackageReference Include="MassTransit.RabbitMQ" Version="9.2.0" />
+    <PackageReference Include="DotNetCore.CAP" Version="8.*" />
+    <PackageReference Include="DotNetCore.CAP.RabbitMQ" Version="8.*" />
+    <PackageReference Include="DotNetCore.CAP.SqlServer" Version="8.*" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.3" />
     <PackageReference Include="StackExchange.Redis" Version="3.1.13" />
