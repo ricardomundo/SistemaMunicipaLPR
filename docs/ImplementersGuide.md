@@ -6,7 +6,7 @@
 
 - .NET 9 SDK
 - Docker Desktop (con WSL2/virtualización habilitada en Windows)
-- `dotnet-ef` como herramienta global: `dotnet tool install --global dotnet-ef`
+- `dotnet-ef` como herramienta global: `dotnet tool install --global dotnet-ef --version 9.0.19`
 
 ## 2. Levantar el entorno local
 
@@ -22,7 +22,7 @@ Verifica que los 4 contenedores estén sanos (`docker ps` — SQL Server, Redis,
 Entra a `http://localhost:8080` con `admin` / `Lpr#Dev_2026!` y:
 
 1. **Crear el realm** `sistema-lpr` (debe coincidir exactamente con `Keycloak:Authority` en `src/Api.Web/appsettings.json`).
-2. **Crear el cliente** `api-web` dentro de ese realm (debe coincidir con `Keycloak:Audience`).
+2. **Crear el cliente** `api-web` dentro de ese realm (debe coincidir con `Keycloak:Audience`), con Client authentication y Direct access grants activados, y un mapper de Audience en `api-web-dedicated` apuntando a `api-web`.
 3. **Crear los realm roles:** `SuperAdmin`, `SupervisorC4`, `OperadorC4`, `PatrullaMovil`, `AuditorForense`.
 4. **Crear usuarios de prueba** y asignarles uno o más de esos roles (Users → tu usuario → Role mapping).
 
@@ -34,12 +34,13 @@ Sin este paso, cualquier llamada autenticada a `Api.Web` fallará la validación
 dotnet ef database update --project src/Api.Web --context LprDbContext
 ```
 
-(`Program.cs` también llama `Database.Migrate()` automáticamente al arrancar — este paso manual es solo para adelantarlo o depurar.) La tabla de políticas de Casbin se crea sola (`EnsureCreated()`) y se siembra con la matriz de permisos por defecto en cada arranque.
+`Program.cs` también aplica las migraciones automáticamente al arrancar (este paso manual es solo para adelantarlo o depurar). La tabla de políticas de Casbin (`casbin_rule`) se crea sola (`EnsureCreated()`, antes de que corran las migraciones de `LprDbContext` — ambos contextos comparten la base `SistemaLPR`) y se siembra con la matriz de permisos por defecto en cada arranque.
 
 ## 5. Correr la API
 
 ```bash
 dotnet run --project src/Api.Web
+dotnet run --project src/Service.Inference
 ```
 
 Prueba rápida sin token (debe dar 401): `GET https://localhost:{puerto}/api/blacklist`.
@@ -49,7 +50,8 @@ Con un token válido de Keycloak (`Authorization: Bearer <token>`) y un usuario 
 
 ### Agregar un nuevo evento
 1. Definir el `record` en `Core.Contracts` (records inmutables, sin lógica).
-2. Si el evento va en el camino caliente (< 300 ms), **no** incluir payloads grandes (imágenes, blobs) — usar una referencia y subir el contenido de forma asíncrona, como se hizo con `PlateReadEvent.ImageReference`.
+2. Decidir el camino de transporte (ver §7): eventos de bajo volumen van por DotNetCore.CAP (agregar su topic a `EventTopics.cs`); eventos de muy alto volumen y sin necesidad de durabilidad/retry van directo por RabbitMQ.Client (agregar su cola a `RawQueues.cs`).
+3. Si el evento va en el camino caliente (< 300 ms), **no** incluir payloads grandes (imágenes, blobs) — usar una referencia y subir el contenido de forma asíncrona, como se hizo con `PlateReadEvent.ImageReference`.
 
 ### Agregar una tabla/entidad
 1. POCO en `Core.Domain` (sin atributos de EF Core — todo el mapeo va en `LprDbContext.OnModelCreating` vía Fluent API).
@@ -65,75 +67,41 @@ public IActionResult MiAccion() => ...
 ```
 Si el objeto/acción es nuevo, agregar las filas correspondientes por rol en `CasbinPolicySeeder.DefaultPolicies` (el seeder es idempotente, seguro de re-ejecutar).
 
-## 7. Fase 2 — cache Redis + mensajería + SignalR (construida 2026-08-18, sin compilar/verificar)
+## 7. Arquitectura de mensajería: DotNetCore.CAP + RabbitMQ.Client
 
-**Importante:** este código se escribió sin poder compilarlo (el entorno donde se escribió no tenía SDK de .NET 9 ni acceso a NuGet) — el primer paso al retomar es `dotnet build` de la solución completa y arreglar lo que salga. Esto aplica doblemente a la migración a DotNetCore.CAP del mismo día (ver §8) — tampoco se pudo compilar del lado del asistente.
+El sistema usa dos caminos de transporte de eventos, según el volumen y las garantías que necesita cada uno:
 
-Lo que se construyó, y cómo encaja:
+| | DotNetCore.CAP | RabbitMQ.Client directo |
+|---|---|---|
+| **Eventos** | `BlacklistHitSavedEvent`, `BlacklistEntryAddedEvent`, `BlacklistEntryRemovedEvent` | `PlateReadEvent` |
+| **Volumen** | Bajo | Alto (~500/seg agregado) |
+| **Garantías** | Outbox transaccional (`cap.Published`/`cap.Received` en SQL Server), reintentos automáticos, idempotencia | Ninguna más allá de lo que da RabbitMQ (cola durable + ack manual) |
+| **Por qué** | El costo por mensaje del outbox transaccional no es un problema a este volumen, y sí aporta durabilidad/reintentos reales | `PlateReadEvent` es una señal efímera de altísimo volumen, sin escritura local que necesite atomicidad con el publish — el costo del outbox de CAP no se justifica y no lo sostiene a este volumen |
 
-1. **`BlacklistCacheService`** (`IHostedService`, en `Service.Inference/BlacklistCacheService.cs`): carga inicial de `VehiculosRobados.Estado = Activo` al set de Redis `blacklist:active-plates` al arrancar (llave centralizada en `Redis/BlacklistRedisKeys.cs`); refresco delta cada 5 min como respaldo (reemplazo atómico vía transacción Redis `DEL`+`SADD`, para no dejar la cache vacía a medio refresh).
-2. **`BlacklistEntryAddedConsumer`/`BlacklistEntryRemovedConsumer`** (`Service.Inference/Consumers/`): invalidación inmediata del set de Redis. Nada los dispara todavía — `BlacklistController` en `Api.Web` sigue siendo el stub de referencia (`Post() => Accepted()`), no persiste ni publica nada. Construir esa parte (alta/baja real de `VehiculoRobado` + publish del evento) queda fuera del alcance de Fase 2 tal como se definió.
-3. **`PlateReadConsumer`** (`Service.Inference/Consumers/PlateReadConsumer.cs`, DotNetCore.CAP `ICapSubscribe`): un solo `SISMEMBER` contra Redis. Si hay match, publica `BlacklistHitSavedEvent` vía `ICapPublisher.PublishAsync(EventTopics.BlacklistHitSaved, ...)` (la notificación por SignalR y la persistencia corren como suscriptores *separados* de ese evento — ver siguiente punto). Si no hay match, por default no escribe nada a SQL — ver "Decisión: log solo de matches" abajo.
-4. **`BlacklistHitPersistenceConsumer`** (`Service.Inference/Consumers/`) y **`AlertNotificationConsumer`** (`Api.Web/Consumers/`): dos suscriptores **independientes** de `BlacklistHitSavedEvent` (mismo topic `EventTopics.BlacklistHitSaved`, en `Core.Contracts/EventTopics.cs`), uno en cada servicio. Cada servicio se registra en CAP con su propio `DefaultGroupName` (`"service-inference"` en `Service.Inference/Program.cs`, `"api-web"` en `Api.Web/Program.cs`) — CAP entrega una copia del mensaje por grupo, así que ambos corren en paralelo sin bloquearse entre sí:
-   - `BlacklistHitPersistenceConsumer` (Service.Inference): resuelve `CamaraId` (por `Codigo`) y `VehiculoRobadoId` (por `PlateText`), inserta `LecturaHistorica` + `Alerta` vía Dapper, deduplicando por `EventId` (atrapa `SqlException` 2601/2627 de violación del índice único).
-   - `AlertNotificationConsumer` (Api.Web): empuja el mensaje `"AlertaBlacklist"` a todos los clientes de `AlertHub` vía `IHubContext<AlertHub>`.
-5. **`AlertHub`** (`Api.Web/Hubs/AlertHub.cs`): SignalR, ruta `/hubs/alerts`, `[Authorize]` (requiere JWT válido, mismo mecanismo de `access_token` en query string que ya soportaba `Program.cs`). Backplane de Redis vía `AddStackExchangeRedis(...)`, ya cableado en `Program.cs`.
+### Camino CAP (`BlacklistHitSavedEvent` y eventos de blacklist)
 
-### Decisión: log solo de matches (configurable)
+- **Modelo de suscripción:** cada consumer implementa el marcador `ICapSubscribe` y expone un método público (por convención, `HandleAsync`) decorado con `[CapSubscribe("<topic>")]`, recibiendo el mensaje deserializado directo como parámetro.
+- **Topics:** CAP enruta por nombre de topic (`string`), no por tipo .NET. Las constantes viven en `Core.Contracts/EventTopics.cs` — usar siempre esas constantes, tanto al publicar como al suscribir.
+- **Publish:** se resuelve `ICapPublisher` (inyectado por DI) y se llama `PublishAsync(topic, evt)`.
+- **`DefaultGroupName` por servicio:** `Service.Inference` y `Api.Web` suscriben ambos a `BlacklistHitSaved` y necesitan cada uno su propia copia del mensaje (uno persiste, el otro empuja por SignalR). Cada servicio configura `x.DefaultGroupName = "..."` en su `AddCap(...)` (`"service-inference"` y `"api-web"` respectivamente) — si dos servicios comparten el mismo `DefaultGroupName` sobre el mismo topic, CAP los trata como competidores por el mismo mensaje, no como suscriptores independientes.
+- **Storage:** `x.UseSqlServer(connectionString)` (tablas `cap.Published`/`cap.Received` en la base `SistemaLPR`) para el outbox, `x.UseRabbitMQ(o => {...})` para el transporte.
+- **Registro en DI:** las clases con `[CapSubscribe]` deben registrarse explícitamente (`AddTransient<TConsumer>()`) para que CAP las descubra al arrancar.
+- **Paquetes:** `DotNetCore.CAP`, `DotNetCore.CAP.RabbitMQ`, `DotNetCore.CAP.SqlServer`, todos `Version="8.*"`.
 
-A pedido explícito del usuario (2026-08-18): `LecturasHistoricas` solo registra lecturas que **sí** coinciden con la blacklist — no se guarda cada lectura para evitar acumular información innecesaria. Esto es configurable en `src/Service.Inference/appsettings.json`:
+### Camino directo (`PlateReadEvent`)
 
-```json
-"PlateReadLogging": { "OnlyLogMatches": true }
-```
-
-`true` (default): `PlateReadConsumer` no toca SQL cuando no hay match; solo `BlacklistHitPersistenceConsumer` inserta `LecturaHistorica` (y solo para matches). `false`: `PlateReadConsumer` también inserta una `LecturaHistorica` por cada lectura sin match (`EsCoincidenciaBlacklist = 0`). **Nota:** esto deja el default real en contradicción con la descripción de la tabla en [TechnicalDocumentation.md §4](TechnicalDocumentation.md#4-modelo-de-datos-coredomain--apiwebdatalprdbcontextcs) ("log de cada lectura, match o no") — pendiente de alinear esa descripción, o de decidir si se documenta como "configurable, default: solo matches".
-
-### Limpieza pendiente
-
-`src/Service.Inference/Worker.cs` (el `BackgroundService` de plantilla que solo logueaba "Worker running at...") ya no está registrado en `Program.cs` — lo reemplazó `BlacklistCacheService`. El archivo se puede borrar, quedó como código muerto.
-
-### Cómo probarlo manualmente: `tools/VerifyFase2`
-
-Nada en el sistema publica `PlateReadEvent` todavía — el simulador de carga es Fase 3, y `BlacklistController` sigue siendo un stub que no publica `BlacklistEntryAddedEvent`/`RemovedEvent`. Para probar el camino completo de Fase 2 a mano se armó `tools/VerifyFase2` (proyecto consola desechable, mismo patrón que `tools/VerifyGeo` de Fase 1 — usa el `LprDbContext` real vía `ProjectReference` a `Api.Web.csproj`, y desde la migración a CAP, un `Host` mínimo con `AddCap(...)` propio para publicar contra el mismo RabbitMQ/SQL Server del `docker-compose.yml`).
-
-**Nota post-migración a CAP:** a diferencia de MassTransit (publish directo al bus), CAP escribe primero el mensaje en su tabla de outbox transaccional (`cap.Published`, en la misma base `SistemaLPR`) y un dispatcher en background lo envía a RabbitMQ poco después. Por eso `PublishAsync` en este tool levanta el host, publica, espera ~5 segundos, y solo entonces lo detiene — si se detuviera de inmediato, el dispatcher no alcanzaría a correr y el mensaje quedaría pendiente en la tabla hasta que otro proceso con CAP configurado arrancara.
-
-**Build (ya viene con `.csproj` y `Program.cs` listos, no hace falta `dotnet new`):**
-```powershell
-cd C:\Ric68\SistemaMunicipaLPR\tools\VerifyFase2
-dotnet build
-```
-
-**Flujo de prueba** (con `docker compose up -d`, `dotnet run --project src\Api.Web` y `dotnet run --project src\Service.Inference` corriendo en sus propias ventanas):
-
-1. `dotnet run -- seed` — crea la `Camara` (`Codigo = CAM-TEST-01`) y el `VehiculoRobado` de prueba (`PlateText = TEST1234`, `Estado = Activo`). Idempotente, seguro de re-correr.
-2. Confirma en el log de `Service.Inference` que `BlacklistCacheService` ya cargó la placa (`"Blacklist cache refrescada: N placas activas."` con `N >= 1`) — si `Service.Inference` ya estaba corriendo antes del `seed`, reinícialo para forzar la carga inicial en vez de esperar el refresco delta de 5 min.
-3. `dotnet run -- publish` — publica un `PlateReadEvent` con la placa de prueba (debe dar match). Verifica en orden:
-   - Log de `PlateReadConsumer` (`Service.Inference`) reportando el match.
-   - Log de `BlacklistHitPersistenceConsumer` (`Service.Inference`) — `"Alerta registrada..."` — y una fila nueva en `LecturasHistoricas`/`Alertas` en SQL.
-   - Log de `AlertNotificationConsumer` (`Api.Web`) — `"Alerta empujada por SignalR..."` — y, si tienes un cliente SignalR conectado a `/hubs/alerts` con un token válido, el mensaje `"AlertaBlacklist"`.
-4. `dotnet run -- publish-nomatch` — publica un `PlateReadEvent` con una placa que no está en la blacklist (`NOMATCH99`). Con `PlateReadLogging:OnlyLogMatches = true` (default), no debe generarse ninguna fila nueva en `LecturasHistoricas` ni ninguna alerta.
-5. `dotnet run -- cleanup` — borra la `Camara`, el `VehiculoRobado` y cualquier `LecturaHistorica`/`Alerta` generada por las pruebas.
+- `PlateReadEvent` se publica y consume con `RabbitMQ.Client` puro, sin pasar por CAP — cola durable `plate-read-event.raw` (constante en `Core.Contracts/RawQueues.cs`).
+- **`RabbitMQ.Client` resuelve en su serie 7.x** (no tiene `PackageReference` explícita — llega transitivamente vía `DotNetCore.CAP.RabbitMQ`), cuya API es async-only: `IChannel` en vez de `IModel`, y los métodos de publish/consumo/ack tienen sufijo `Async` (`CreateConnectionAsync`, `CreateChannelAsync`, `QueueDeclareAsync`, `BasicPublishAsync`, `BasicConsumeAsync`, `BasicAckAsync`/`BasicNackAsync`, `BasicQosAsync`). `BasicProperties` se instancia directo (`new BasicProperties()`, ya no `channel.CreateBasicProperties()`), y el mensaje persistente se marca con `DeliveryMode = DeliveryModes.Persistent`.
+- **Publish:** abrir una `IConnection`/`IChannel`, declarar la cola (`durable: true`), serializar el evento a JSON (`System.Text.Json`) y `BasicPublishAsync`. Ver `tools/VerifyFase2/Program.cs` y `tools/LoadSimulator/Program.cs` como referencia.
+- **Consumo:** `Service.Inference/Consumers/PlateReadConsumer.cs` es un `BackgroundService` normal (no un `[CapSubscribe]`) que abre su propio canal, configura `BasicQosAsync(prefetchCount: 100)` (necesario para throughput — sin esto RabbitMQ entrega un mensaje a la vez y espera el ack), y consume con `AsyncEventingBasicConsumer` (evento `ReceivedAsync`): deserializa el body, ejecuta el lookup de blacklist en Redis, y hace `BasicAckAsync`/`BasicNackAsync(requeue: true)` según el resultado. Si hay match, publica `BlacklistHitSavedEvent` — ese publish sí va por CAP (camino de bajo volumen). El cierre de `IChannel`/`IConnection` (ambos `IAsyncDisposable`) se hace en `StopAsync`, no en `Dispose()`.
+- **Registro en DI:** se registra como `AddHostedService<PlateReadConsumer>()` (no `AddTransient` — no es un suscriptor de CAP).
+- **Threading:** un `IChannel` (canal) de RabbitMQ.Client no es seguro para uso concurrente entre threads; una `IConnection` compartida sí permite `CreateChannelAsync()` concurrente. Si necesitas publicar desde múltiples tareas concurrentes, comparte la conexión y da un canal propio a cada tarea.
+- **Nota para un publisher en Python (pipeline Edge, Fase 3):** al no pasar por CAP, publicar `PlateReadEvent` desde Python es un publish AMQP estándar (JSON plano a la cola `plate-read-event.raw`, con cualquier cliente como `pika`) — no hace falta replicar ningún envelope propio de CAP.
 
 ## 8. Notas operativas conocidas
 
-- **`dotnet run --project src/Api.Web` (o `Service.Inference`) truena con `MassTransit.ConfigurationException: ... License must be specified with SetLicense/SetLicenseLocation or by setting the MT_LICENSE/MT_LICENSE_PATH environment variables`** (encontrado en la verificación real de Fase 2, 2026-08-18): `MassTransit.RabbitMQ` en su línea `9.x` (la que quedó pineada al construir Fase 2) exige configurar una licencia para poder arrancar el bus, incluso en local — cambio de modelo de negocio de MassTransit, no un bug de este proyecto.
-  - **Primer intento (descartado):** bajar `MassTransit.RabbitMQ` a la última versión mayor 8.x (licencia MIT/Apache, sin este requerimiento). Llegó a aplicarse en ambos `.csproj`, pero el usuario decidió no depender de una serie de MassTransit sin soporte activo del proyecto y reemplazar la librería por completo — ver el punto siguiente.
-  - **Decisión final tomada (2026-08-18): migración completa de MassTransit a DotNetCore.CAP.** CAP (MIT, sin licencia comercial) es la librería de mensajería usada de aquí en adelante en `Api.Web` y `Service.Inference`. Diferencias clave a tener en cuenta al tocar este código:
-    - **Modelo de suscripción:** en vez de `IConsumer<T>` + `Consume(ConsumeContext<T>)`, cada consumer implementa el marcador `ICapSubscribe` y expone un método público (cualquier nombre — se usó `HandleAsync` por convención) decorado con `[CapSubscribe("<topic>")]`, recibiendo el mensaje deserializado directo como parámetro.
-    - **Topics en vez de tipos:** CAP enruta por nombre de topic (`string`), no por el tipo .NET del mensaje como hacía MassTransit. Los nombres de topic viven centralizados en `Core.Contracts/EventTopics.cs` (`PlateRead`, `BlacklistHitSaved`, `BlacklistEntryAdded`, `BlacklistEntryRemoved`) — usar siempre esas constantes, tanto al publicar como al suscribir, para no desalinear el string a mano en dos lugares.
-    - **Publish:** en vez de resolver `IPublishEndpoint`/`IBus` y llamar `Publish<T>(evt)`, se resuelve `ICapPublisher` (inyectado por DI) y se llama `PublishAsync(topic, evt)`.
-    - **"Cola por servicio" → `DefaultGroupName`:** MassTransit le daba automáticamente su propia cola a cada consumer (vía `ConfigureEndpoints`), lo que permitía que `Service.Inference` y `Api.Web` recibieran cada uno su propia copia de `BlacklistHitSavedEvent`. CAP necesita esto explícito: cada servicio configura `x.DefaultGroupName = "..."` en su `AddCap(...)` (`"service-inference"` y `"api-web"` respectivamente) — si dos servicios comparten el mismo `DefaultGroupName` sobre el mismo topic, CAP los trata como competidores por el mismo mensaje (uno de los dos no lo recibe), no como suscriptores independientes.
-    - **Outbox transaccional:** CAP requiere configurar un almacén de persistencia además del transporte — aquí `x.UseSqlServer(connectionString)` (la misma base `SistemaLPR`) para su tabla `cap.Published`/`cap.Received`, y `x.UseRabbitMQ(o => {...})` para el transporte. Un publish no sale directo al broker: se escribe primero en `cap.Published` dentro de la misma conexión/transacción, y un dispatcher en background lo envía a RabbitMQ poco después (típicamente sub-segundo, pero no instantáneo — importa para herramientas de prueba de vida corta, ver la nota sobre `tools/VerifyFase2` en §7). No se detectó (ni se esperaba) el mismo bug de `EnsureCreated()`/"la base ya tiene tablas" que afectó a `CasbinDbContext<int>` — CAP crea su propio esquema con su propio mecanismo de bootstrap, independiente del de EF Core.
-    - **Registro en DI:** las clases con `[CapSubscribe]` deben registrarse explícitamente en el contenedor (`AddTransient<TConsumer>()`) para que CAP las descubra al arrancar — a diferencia de `AddConsumer<T>()` de MassTransit, `AddCap(...)` no las registra por sí solo.
-    - **Paquetes:** se quitó `MassTransit.RabbitMQ` de ambos `.csproj` y se agregaron `DotNetCore.CAP`, `DotNetCore.CAP.RabbitMQ` y `DotNetCore.CAP.SqlServer`, todos `Version="8.*"` (flotante a propósito — no se pudo confirmar el número de patch exacto disponible al momento de escribir esto, sin acceso a NuGet del lado del asistente).
-  - Archivos tocados por esta migración: `Core.Contracts/EventTopics.cs` (nuevo), los cuatro consumers de `Service.Inference/Consumers/`, `Service.Inference/Program.cs`, `Api.Web/Consumers/AlertNotificationConsumer.cs`, `Api.Web/Program.cs`, ambos `.csproj`, y `tools/VerifyFase2/Program.cs` (su función `PublishAsync` ahora levanta su propio `Host` con `AddCap(...)` en vez de un `IBusControl` de MassTransit standalone).
-  - **Sin verificar:** ninguno de estos archivos se pudo compilar del lado del asistente (mismo problema de siempre — sin SDK/NuGet accesibles). Primer paso al retomar: `dotnet restore` + `dotnet build` de la solución completa, y luego `dotnet run --project src/Api.Web` y `dotnet run --project src/Service.Inference` para confirmar que ninguno truena al arrancar `AddCap(...)`.
-- Este entorno de desarrollo (sandbox) no tuvo Docker disponible durante la construcción de Fase 0/1 — el `docker compose up -d` y la configuración de Keycloak **no se probaron de punta a punta durante la construcción**. Verificación en progreso desde el 2026-08-18 en una laptop con Docker Desktop (ver [fases.md](fases.md) para el estado exacto de qué ya se confirmó).
-- Varios paquetes NuGet de Microsoft empezaron a publicar versiones que exigen `net10.0`; si `dotnet add package <algo-de-Microsoft>` falla con `NU1202`, buscar la última versión `9.0.x` explícita en vez de dejar que tome la última disponible (ver [TechnicalDocumentation.md §6](TechnicalDocumentation.md#6-paquetes-nuget-relevantes-y-notas-de-versión)).
-- **`dotnet ef` falla con `Unable to retrieve project metadata. Ensure it's an SDK-style project.`** aunque el `.csproj` sea correcto (SDK-style, bien formado): este mensaje es genérico y engañoso — `dotnet-ef` dispara internamente un build de diseño del proyecto para leer su metadata, y si ese build falla por cualquier motivo, lo reporta siempre con este mismo texto en vez del error real.
-  - **Causa más común:** desalineación de versiones entre el SDK de .NET instalado y el tool global `dotnet-ef`. `dotnet tool install --global dotnet-ef` sin fijar versión siempre toma la última publicada (por ejemplo, instala `10.x` aunque el proyecto sea `net9.0` y el SDK instalado sea `9.x`) — esa combinación no es soportada y el build de diseño falla silenciosamente.
+- **`dotnet ef` falla con `Unable to retrieve project metadata. Ensure it's an SDK-style project.`** aunque el `.csproj` sea correcto: este mensaje es genérico y engañoso — `dotnet-ef` dispara internamente un build de diseño del proyecto para leer su metadata, y si ese build falla por cualquier motivo, lo reporta siempre con este mismo texto en vez del error real.
+  - **Causa más común:** desalineación de versiones entre el SDK de .NET instalado y el tool global `dotnet-ef`. `dotnet tool install --global dotnet-ef` sin fijar versión toma la última publicada, que puede ser mayor que el SDK instalado — esa combinación no es soportada.
   - **Diagnóstico:**
     ```bash
     dotnet --list-sdks   # confirmar que aparece una línea 9.x.x
@@ -144,16 +112,58 @@ dotnet build
     dotnet tool uninstall --global dotnet-ef
     dotnet tool install --global dotnet-ef --version 9.0.19
     ```
-  - Confirmado en la verificación real del 2026-08-18: con SDK `9.x` y `dotnet-ef` en `10.x` fallaba con este error; al fijar `dotnet-ef` a `9.0.19` la migración `InitialLprSchema` aplicó limpio contra SQL Server.
-- **`dotnet run --project src/Api.Web` falla al arrancar con `SqlException: Invalid object name 'casbin_rule'`** (justo después de "No migrations were applied. The database is already up to date." en el log): bug real de orden de arranque en `Program.cs`, encontrado en la verificación end-to-end del 2026-08-18, ya corregido en el código.
-  - **Causa:** `CasbinDbContext<int>.Database.EnsureCreated()` solo crea su propio esquema cuando la base de datos física tiene **cero** tablas. Como `CasbinDbContext<int>` comparte la base `SistemaLPR` con `LprDbContext` (ver `appsettings.json`), si `LprDbContext.Database.Migrate()` corre primero y crea `Camaras`/`VehiculosRobados`/etc., `EnsureCreated()` ve que la base "ya tiene tablas" y **no crea** `casbin_rule` — el enforcer de Casbin truena al intentar cargar políticas en el primer arranque.
-  - **Fix aplicado:** en `Program.cs` se invirtió el orden — `CasbinDbContext<int>.Database.EnsureCreated()` corre **antes** que `LprDbContext.Database.Migrate()`, así `EnsureCreated()` ve la base todavía vacía y sí crea `casbin_rule`.
-  - **Importante — no es retroactivo:** si tu base ya quedó bootstrapeada con el orden viejo (le faltará `casbin_rule` aunque las demás tablas existan), el swap de orden por sí solo no la arregla. Hay que resetear una vez el volumen de SQL Server (no toca Redis/RabbitMQ/Keycloak, la config del realm no se pierde):
-    ```powershell
-    docker compose stop sqlserver
-    docker compose rm -f sqlserver
-    docker volume ls            # busca el volumen *_sqlserver_data
-    docker volume rm <nombre_del_volumen_sqlserver_data>
-    docker compose up -d sqlserver
-    ```
-    Después, `dotnet run --project src/Api.Web` reconstruye todo desde cero en el orden correcto.
+- **Keycloak devuelve `invalid_grant: Account is not fully set up`** en un `password grant`: el usuario tiene una "required action" pendiente (típicamente porque la contraseña quedó marcada `Temporary`). Entra a `http://localhost:8080/realms/sistema-lpr/account/` e inicia sesión con ese usuario — Keycloak muestra en pantalla la acción exacta que falta completar; complétala ahí y reintenta el `password grant`.
+- **`SqlException: Invalid object name 'casbin_rule'`** al arrancar `Api.Web`: `CasbinDbContext<int>.Database.EnsureCreated()` solo crea su propio esquema cuando la base de datos física tiene **cero** tablas. Como `CasbinDbContext<int>` comparte la base `SistemaLPR` con `LprDbContext`, `EnsureCreated()` debe correr **antes** de `LprDbContext.Database.Migrate()` en `Program.cs` (ya está así en el código actual). Si una base ya quedó bootstrapeada en el orden incorrecto, hay que resetear el volumen de SQL Server una vez (no afecta a Redis/RabbitMQ/Keycloak):
+  ```powershell
+  docker compose stop sqlserver
+  docker compose rm -f sqlserver
+  docker volume ls            # busca el volumen *_sqlserver_data
+  docker volume rm <nombre_del_volumen_sqlserver_data>
+  docker compose up -d sqlserver
+  ```
+  Después, `dotnet run --project src/Api.Web` reconstruye todo desde cero en el orden correcto.
+- Varios paquetes NuGet de Microsoft publican versiones que exigen `net10.0`; si `dotnet add package <algo-de-Microsoft>` falla con `NU1202`, buscar la última versión `9.0.x` explícita en vez de dejar que tome la última disponible (ver [TechnicalDocumentation.md §6](TechnicalDocumentation.md#6-paquetes-nuget-relevantes-y-notas-de-versión)).
+- `RabbitMQ.Client` no tiene `PackageReference` explícita en ningún `.csproj` — se resuelve transitivamente vía `DotNetCore.CAP.RabbitMQ`, en su serie 7.x (API async-only, ver §7). Si al compilar aparecen errores de overload en `BasicPublishAsync`/`BasicConsumeAsync`/`CreateChannelAsync` (nombres de parámetro o cantidad de argumentos), es la firma exacta de la versión de paquete resuelta — ajustar contra lo que sugiera el compilador/IntelliSense.
+
+## 9. Herramientas de prueba: `tools/VerifyFase2` y `tools/LoadSimulator`
+
+Ninguna de las dos está registrada en `SistemaLPR.sln` (convención del repo para herramientas desechables) — se compilan y corren desde su propia carpeta.
+
+### `tools/VerifyFase2`
+
+Verifica a mano el camino completo de Fase 2 (no hay todavía ningún publisher real de `PlateReadEvent` fuera de este tool y de `tools/LoadSimulator`, ni un flujo real de alta/baja de `VehiculoRobado` — `BlacklistController` sigue siendo un stub).
+
+```powershell
+cd C:\Ric68\SistemaMunicipaLPR\tools\VerifyFase2
+dotnet build
+```
+
+Con `docker compose up -d`, `dotnet run --project src\Api.Web` y `dotnet run --project src\Service.Inference` corriendo en sus propias ventanas:
+
+1. `dotnet run -- seed` — crea la `Camara` (`Codigo = CAM-TEST-01`) y el `VehiculoRobado` de prueba (`PlateText = TEST1234`, `Estado = Activo`). Idempotente.
+2. Confirma en el log de `Service.Inference` que `BlacklistCacheService` ya cargó la placa (`"Blacklist cache refrescada: N placas activas."` con `N >= 1`) — si `Service.Inference` ya estaba corriendo antes del `seed`, reinícialo para forzar la carga inicial.
+3. `dotnet run -- publish` — publica un `PlateReadEvent` con la placa de prueba (debe dar match) directo a la cola `plate-read-event.raw`. Verifica en orden:
+   - Log de `PlateReadConsumer` (`Service.Inference`) reportando el match.
+   - Log de `BlacklistHitPersistenceConsumer` (`Service.Inference`) y una fila nueva en `LecturasHistoricas`/`Alertas` en SQL.
+   - Log de `AlertNotificationConsumer` (`Api.Web`) y, si tienes un cliente SignalR conectado a `/hubs/alerts` con un token válido, el mensaje `"AlertaBlacklist"`.
+4. `dotnet run -- publish-nomatch` — publica un `PlateReadEvent` con una placa que no está en la blacklist (`NOMATCH99`). Con `PlateReadLogging:OnlyLogMatches = true` (default), no debe generarse ninguna fila nueva.
+5. `dotnet run -- cleanup` — borra la `Camara`, el `VehiculoRobado` y cualquier `LecturaHistorica`/`Alerta` generada por las pruebas.
+
+### `tools/LoadSimulator`
+
+Genera carga sintética contra el mismo RabbitMQ/CAP que usan `Api.Web`/`Service.Inference`, para medir el camino caliente real (Redis lookup → persistencia → SignalR) sin depender del pipeline Edge de Python.
+
+```powershell
+cd C:\Ric68\SistemaMunicipaLPR\tools\LoadSimulator
+dotnet build
+```
+
+- `dotnet run -- seed [--cameras N]` — siembra `N` cámaras (`CAM-SIM-0001`..`CAM-SIM-NNNN`, default 50) y una placa `SIMHIT001` como `VehiculoRobado` `Activo`. Idempotente.
+- `dotnet run -- run [--cameras N] [--rate R] [--duration S] [--match-ratio P] [--drain-seconds S]` — publica `PlateReadEvent` real directo a RabbitMQ, con `N` "cámaras" concurrentes publicando a `R` lecturas/seg cada una (defaults: `N=50`, `R=10` → ~500 eventos/seg agregados). Una fracción `P` (default `0.01`) de las lecturas de cada cámara usa la placa `SIMHIT001` para generar match real; el resto usa placas aleatorias `SIM<hex>` sin match. Sin `--duration` corre hasta Ctrl+C. Al detenerse, espera `--drain-seconds` (default `15`) con su suscriptor de latencia todavía activo antes de imprimir el resumen final, para no dejar hits en tránsito sin medir.
+- `dotnet run -- cleanup [--cameras N]` — borra las cámaras sembradas, el `VehiculoRobado` `SIMHIT001`, y cualquier `LecturaHistorica`/`Alerta` cuya `PlateText` empiece con `SIM`.
+
+**Cómo mide la latencia cámara→alerta:** el tool se suscribe a `BlacklistHitSavedEvent` vía CAP (`HitLatencyConsumer`, `DefaultGroupName = "load-simulator"` — no compite con `service-inference` ni `api-web`, cada uno recibe su copia). Al publicar una lectura con la placa caliente, guarda `EventId → hora de publish`; cuando llega el `BlacklistHitSavedEvent` correspondiente, calcula la diferencia — ese número es el presupuesto de <300ms de Fase 3, medido end-to-end.
+
+**Por qué solo se mide latencia del 1% con match:** con `PlateReadLogging:OnlyLogMatches=true` (default), el resto de las lecturas nunca tocan SQL — para esas, lo relevante es que RabbitMQ no acumule backlog (visible en `http://localhost:15672`), una métrica de throughput distinta que hay que revisar a mano durante el `run`.
+
+**Nota sobre el outbox de CAP bajo carga sintética:** este tool sigue usando CAP (con `UseSqlServer`) para su propio suscriptor de `BlacklistHitSavedEvent` — a la escala de eventos de blacklist (1% del tráfico) esto no genera carga significativa en `cap.Published`/`cap.Received`. Si se aumenta mucho `--match-ratio`, considerar limpiar esas tablas manualmente de vez en cuando (`cleanup` no las toca).

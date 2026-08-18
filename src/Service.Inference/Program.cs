@@ -15,10 +15,14 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
 
 // Los suscriptores de CAP (clases con [CapSubscribe]) deben estar registrados en el
 // contenedor de DI para que CAP los descubra al arrancar.
-builder.Services.AddTransient<PlateReadConsumer>();
 builder.Services.AddTransient<BlacklistHitPersistenceConsumer>();
 builder.Services.AddTransient<BlacklistEntryAddedConsumer>();
 builder.Services.AddTransient<BlacklistEntryRemovedConsumer>();
+
+// PlateReadConsumer YA NO es un suscriptor de CAP (2026-08-18) — se registra como
+// BackgroundService normal porque habla RabbitMQ.Client directo, fuera del outbox de CAP. Ver
+// el comentario en Consumers/PlateReadConsumer.cs e ImplementersGuide.md §9 para el porqué.
+builder.Services.AddHostedService<PlateReadConsumer>();
 
 builder.Services.AddCap(x =>
 {

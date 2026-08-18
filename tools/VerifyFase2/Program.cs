@@ -1,11 +1,10 @@
+using System.Text.Json;
 using Api.Web.Data;
 using Core.Contracts;
 using Core.Domain;
-using DotNetCore.CAP;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.EntityFrameworkCore;
 using NetTopologySuite.Geometries;
+using RabbitMQ.Client;
 
 // Herramienta desechable para probar el camino completo de Fase 2 a mano, ya que todavía no
 // existe ningún publisher real de PlateReadEvent (eso lo trae el simulador de Fase 3) ni un
@@ -101,59 +100,52 @@ async Task SeedAsync()
 
 async Task PublishAsync(string plateText, string descripcion)
 {
-    // CAP no publica directo a RabbitMQ como hacía MassTransit — primero escribe el mensaje en
-    // su tabla de outbox transaccional (cap.Published, en esta misma base "SistemaLPR") y un
-    // dispatcher en background lo envía al broker poco después. Por eso este host se queda
-    // arriba unos segundos tras el publish antes de detenerse: si se cierra de inmediato, el
-    // dispatcher no alcanza a correr y el mensaje se queda pendiente en la tabla hasta el
-    // próximo arranque de un proceso con CAP configurado.
-    var builder = Host.CreateApplicationBuilder();
-    builder.Services.AddCap(x =>
+    // PlateReadEvent se publica directo a RabbitMQ con RabbitMQ.Client — no pasa por el outbox
+    // de CAP (ver Core.Contracts/RawQueues.cs e ImplementersGuide.md §7). El paquete resuelto es
+    // RabbitMQ.Client 7.x, cuya API es async-only (IChannel en vez de IModel, métodos *Async) —
+    // no existe overload síncrono de CreateConnection/CreateModel en esta versión.
+    var factory = new ConnectionFactory
     {
-        x.UseSqlServer(connectionString);
-        x.UseRabbitMQ(o =>
-        {
-            o.HostName = "localhost";
-            o.VirtualHost = "/";
-            o.UserName = "guest";
-            o.Password = "guest";
-        });
-        x.DefaultGroupName = "verify-fase2-tool";
-    });
+        HostName = "localhost",
+        VirtualHost = "/",
+        UserName = "guest",
+        Password = "guest"
+    };
 
-    using var host = builder.Build();
-    await host.StartAsync();
-    try
+    await using var connection = await factory.CreateConnectionAsync("verify-fase2.plate-read-raw");
+    await using var channel = await connection.CreateChannelAsync();
+    await channel.QueueDeclareAsync(RawQueues.PlateRead, durable: true, exclusive: false, autoDelete: false);
+
+    var evt = new PlateReadEvent
     {
-        var capPublisher = host.Services.GetRequiredService<ICapPublisher>();
+        EventId = Guid.NewGuid(),
+        PlateText = plateText,
+        CameraId = testCamaraCodigo,
+        TimestampUtc = DateTime.UtcNow,
+        Confidence = 0.95,
+        ImageReference = null
+    };
 
-        var evt = new PlateReadEvent
-        {
-            EventId = Guid.NewGuid(),
-            PlateText = plateText,
-            CameraId = testCamaraCodigo,
-            TimestampUtc = DateTime.UtcNow,
-            Confidence = 0.95,
-            ImageReference = null
-        };
+    // BasicProperties ya no se obtiene de channel.CreateBasicProperties() (ese método no existe
+    // en 7.x) — se instancia directo. El booleano "Persistent" también se reemplazó por el enum
+    // DeliveryMode; si esta línea no compila contra tu versión exacta del paquete, prueba
+    // "Persistent = true" en su lugar (nombre usado en versiones anteriores de la librería).
+    var properties = new BasicProperties { DeliveryMode = DeliveryModes.Persistent };
+    var body = JsonSerializer.SerializeToUtf8Bytes(evt);
+    await channel.BasicPublishAsync(
+        exchange: "",
+        routingKey: RawQueues.PlateRead,
+        mandatory: false,
+        basicProperties: properties,
+        body: body);
 
-        await capPublisher.PublishAsync(EventTopics.PlateRead, evt);
-
-        Console.WriteLine($"PlateReadEvent publicado ({descripcion}): EventId={evt.EventId}, PlateText={evt.PlateText}, CameraId={evt.CameraId}.");
-        Console.WriteLine("Esperando ~5s a que el dispatcher de CAP lo envíe a RabbitMQ...");
-        await Task.Delay(TimeSpan.FromSeconds(5));
-
-        Console.WriteLine();
-        Console.WriteLine("Revisa ahora:");
-        Console.WriteLine("  1. Log de Service.Inference (PlateReadConsumer) — debe loguear el match o simplemente consumir sin logs si no hay match.");
-        Console.WriteLine("  2. Si hubo match: log de BlacklistHitPersistenceConsumer (\"Alerta registrada...\") y una fila nueva en LecturasHistoricas + Alertas en SQL.");
-        Console.WriteLine("  3. Si hubo match: log de AlertNotificationConsumer en Api.Web (\"Alerta empujada por SignalR...\"), y un cliente SignalR conectado a");
-        Console.WriteLine("     /hubs/alerts (con un token válido) debería recibir el mensaje \"AlertaBlacklist\".");
-    }
-    finally
-    {
-        await host.StopAsync();
-    }
+    Console.WriteLine($"PlateReadEvent publicado ({descripcion}): EventId={evt.EventId}, PlateText={evt.PlateText}, CameraId={evt.CameraId}.");
+    Console.WriteLine();
+    Console.WriteLine("Revisa ahora:");
+    Console.WriteLine("  1. Log de Service.Inference (PlateReadConsumer) — debe loguear el match o simplemente consumir sin logs si no hay match.");
+    Console.WriteLine("  2. Si hubo match: log de BlacklistHitPersistenceConsumer (\"Alerta registrada...\") y una fila nueva en LecturasHistoricas + Alertas en SQL.");
+    Console.WriteLine("  3. Si hubo match: log de AlertNotificationConsumer en Api.Web (\"Alerta empujada por SignalR...\"), y un cliente SignalR conectado a");
+    Console.WriteLine("     /hubs/alerts (con un token válido) debería recibir el mensaje \"AlertaBlacklist\".");
 }
 
 async Task CleanupAsync()

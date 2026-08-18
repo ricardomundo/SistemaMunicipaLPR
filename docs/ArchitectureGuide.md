@@ -28,19 +28,20 @@ Patrón **Event-Driven Architecture (EDA)** en C#/.NET para lograr latencias baj
 
 ```mermaid
 flowchart LR
-    CAM["Cámara LPR (Edge)\nYOLOv8/v11 + OpenCV + EasyOCR\nJetson Orin Nano"] -->|PlateReadEvent| MQ[("RabbitMQ\n+ MassTransit")]
-    MQ --> CONS["Consumer .NET\n(Service.Inference)"]
+    CAM["Cámara LPR (Edge)\nYOLOv8/v11 + OpenCV + EasyOCR\nJetson Orin Nano"] -->|PlateReadEvent| RAWQ[("RabbitMQ\nplate-read-event.raw")]
+    RAWQ --> CONS["PlateReadConsumer\n(Service.Inference)"]
     CONS -->|lookup O(1)| REDIS[("Redis\nBlacklist cache")]
-    CONS -->|match| ALERT["BlacklistHitSavedEvent"]
-    CONS -->|match| HUB["SignalR Hub\n(AlertHub)"]
+    CONS -->|match, vía CAP| ALERT["BlacklistHitSavedEvent"]
+    ALERT -->|CAP| HUB["SignalR Hub\n(AlertHub, en Api.Web)"]
     HUB -->|push < 100ms| C4["Dashboard C4 / App patrullas"]
-    ALERT --> SQL[("SQL Server\nLecturaHistorica + Alerta")]
-    ADMIN["Alta/baja en\nVehiculosRobados"] -->|BlacklistEntryAdded/RemovedEvent| REDIS
+    ALERT -->|CAP| SQL[("SQL Server\nLecturaHistorica + Alerta")]
+    ADMIN["Alta/baja en\nVehiculosRobados"] -->|BlacklistEntryAdded/RemovedEvent, vía CAP| REDIS
 ```
 
 **Tecnologías:**
 - **RabbitMQ** — amortigua el tráfico de cámaras (publish/subscribe); si la BD se ralentiza, no se pierde un evento.
-- **MassTransit** — contratos de eventos fuertemente tipados en C#, reintentos y dead-letter queues automáticos.
+- **RabbitMQ.Client directo** para `PlateReadEvent` — el evento de mayor volumen del sistema (cientos por segundo). Se publica y consume por AMQP puro, con ack manual, sin pasar por ningún outbox transaccional: es una señal efímera sin escritura local que necesite atomicidad con el publish, así que no vale la pena pagar el costo de un outbox transaccional a este volumen.
+- **DotNetCore.CAP** para el resto de los eventos (`BlacklistHitSavedEvent`, `BlacklistEntryAddedEvent`/`RemovedEvent`) — volumen bajo, se benefician de outbox transaccional (persistido en SQL Server), reintentos automáticos y agrupación de suscriptores por servicio (`DefaultGroupName`).
 - **ASP.NET Core SignalR** — WebSocket persistente hacia C4 y la app móvil; push de alerta en < 100 ms, con backplane de Redis para escalar a múltiples instancias de `Api.Web`.
 
 ### Presupuesto de latencia (< 300 ms) y su riesgo principal
@@ -59,7 +60,7 @@ Separación explícita de responsabilidades — cada sistema es la única fuente
 
 Roles: `SuperAdmin`, `SupervisorC4`, `OperadorC4`, `PatrullaMovil`, `AuditorForense`.
 
-`Service.Inference` (worker interno de RabbitMQ) no requiere autenticación de usuario — no está expuesto por HTTP. El `AlertHub` (SignalR, pendiente de Fase 2/3) validará el mismo JWT de Keycloak vía la query string de la conexión WebSocket.
+`Service.Inference` (worker interno de RabbitMQ) no requiere autenticación de usuario — no está expuesto por HTTP. El `AlertHub` (SignalR) valida el mismo JWT de Keycloak vía la query string de la conexión WebSocket.
 
 Ver [TechnicalDocumentation.md](TechnicalDocumentation.md#autenticación-y-autorización) para el detalle de implementación y [ImplementersGuide.md](ImplementersGuide.md) para cómo configurar Keycloak.
 
@@ -76,7 +77,7 @@ Ver [TechnicalDocumentation.md](TechnicalDocumentation.md#autenticación-y-autor
 ## 6. Stack tecnológico
 
 - **Lenguaje/runtime:** C# / .NET 9 (LTS)
-- **Backend:** ASP.NET Core Web API + SignalR Hubs + MassTransit
+- **Backend:** ASP.NET Core Web API + SignalR Hubs + DotNetCore.CAP + RabbitMQ.Client
 - **Edge:** Python (YOLOv8/v11 + OpenCV + EasyOCR) sobre NVIDIA Jetson Orin Nano o PC industrial
 - **Persistencia:** Dapper (inserciones masivas de alto rendimiento) + EF Core (gestión de usuarios/roles/admin, más compleja)
 - **Bases de datos:** SQL Server 2022 + Redis
@@ -89,7 +90,7 @@ Ver [TechnicalDocumentation.md](TechnicalDocumentation.md#autenticación-y-autor
 | Fase 0 | Infraestructura base (docker-compose, esqueleto de solución .NET) | ✅ Completa |
 | Pre-Fase 1 | Modelo de Authentication/Authorization (Keycloak + Casbin.NET) | ✅ Completa |
 | Fase 1 | Contratos de eventos + modelo de datos SQL Server | ✅ Completa |
-| Fase 2 | Cache en Redis (`BlacklistCacheService`), consumers MassTransit/RabbitMQ, `AlertHub` SignalR | ⏳ Pendiente |
-| Fase 3 | Simulador de carga (50 cámaras × 10 lecturas/seg) + módulo Edge Python/YOLO | ⏳ Pendiente |
+| Fase 2 | Cache en Redis (`BlacklistCacheService`), mensajería (CAP + RabbitMQ.Client), `AlertHub` SignalR | ✅ Completa |
+| Fase 3 | Simulador de carga (50 cámaras × 10 lecturas/seg) + módulo Edge Python/YOLO | 🔶 En progreso |
 
 Detalle de estado de implementación real (qué archivos existen hoy) en [TechnicalDocumentation.md](TechnicalDocumentation.md).
