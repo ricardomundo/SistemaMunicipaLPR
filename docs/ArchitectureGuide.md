@@ -22,20 +22,22 @@ El sistema captura y procesa en tiempo real flujos de video de cámaras instalad
 1. **Invalidación inmediata event-driven** (`BlacklistEntryAddedEvent` / `BlacklistEntryRemovedEvent`) — se dispara al insertar/remover una fila en `VehiculosRobados`, propagando el cambio a Redis en segundos.
 2. **Refresco delta periódico (5 min)** — como respaldo de reconciliación, no como mecanismo primario.
 
+**Alimentación de `VehiculosRobados`:** los reportes de robo llegan por tres vías que traen los mismos datos — alta/baja manual de un operador, archivos Excel/`.txt`, y (a futuro) una API externa — todas convergiendo en un mismo servicio de reconciliación por placa antes de tocar SQL Server, para que las tres disparen exactamente el mismo mecanismo de invalidación de Redis descrito arriba. Detalle en [ImplementersGuide.md §11](ImplementersGuide.md#11-alimentación-de-la-lista-negra-vehiculosrobados).
+
 ## 3. Arquitectura de eventos y mensajería
 
 Patrón **Event-Driven Architecture (EDA)** en C#/.NET para lograr latencias bajas y escalabilidad desacoplada:
 
 ```mermaid
 flowchart LR
-    CAM["Cámara LPR (Edge)\nYOLOv8/v11 + OpenCV + EasyOCR\nJetson Orin Nano"] -->|PlateReadEvent| RAWQ[("RabbitMQ\nplate-read-event.raw")]
+    CAM["Cámara LPR (Edge)\nYOLOv8/v11 + OpenCV + PaddleOCR\nJetson Orin Nano"] -->|PlateReadEvent| RAWQ[("RabbitMQ\nplate-read-event.raw")]
     RAWQ --> CONS["PlateReadConsumer\n(Service.Inference)"]
-    CONS -->|lookup O(1)| REDIS[("Redis\nBlacklist cache")]
-    CONS -->|match, vía CAP| ALERT["BlacklistHitSavedEvent"]
+    CONS -->|"lookup O(1)"| REDIS[("Redis\nBlacklist cache")]
+    CONS -->|"match, vía CAP"| ALERT["BlacklistHitSavedEvent"]
     ALERT -->|CAP| HUB["SignalR Hub\n(AlertHub, en Api.Web)"]
-    HUB -->|push < 100ms| C4["Dashboard C4 / App patrullas"]
+    HUB -->|"push < 100ms"| C4["Dashboard C4 / App patrullas"]
     ALERT -->|CAP| SQL[("SQL Server\nLecturaHistorica + Alerta")]
-    ADMIN["Alta/baja en\nVehiculosRobados"] -->|BlacklistEntryAdded/RemovedEvent, vía CAP| REDIS
+    ADMIN["BlacklistController\n(alta/baja en VehiculosRobados)"] -->|"BlacklistEntryAdded/RemovedEvent, vía CAP"| REDIS
 ```
 
 **Tecnologías:**
@@ -78,7 +80,7 @@ Ver [TechnicalDocumentation.md](TechnicalDocumentation.md#autenticación-y-autor
 
 - **Lenguaje/runtime:** C# / .NET 9 (LTS)
 - **Backend:** ASP.NET Core Web API + SignalR Hubs + DotNetCore.CAP + RabbitMQ.Client
-- **Edge:** Python (YOLOv8/v11 + OpenCV + EasyOCR) sobre NVIDIA Jetson Orin Nano o PC industrial
+- **Edge:** Python (YOLOv8/v11 + OpenCV + PaddleOCR) sobre NVIDIA Jetson Orin Nano o PC industrial
 - **Persistencia:** Dapper (inserciones masivas de alto rendimiento) + EF Core (gestión de usuarios/roles/admin, más compleja)
 - **Bases de datos:** SQL Server 2022 + Redis
 - **Frontend C4:** React o Angular con WebSockets activos (no seleccionado aún — pendiente)

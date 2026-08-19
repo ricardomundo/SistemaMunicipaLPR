@@ -28,10 +28,22 @@ from .events import PlateReadEvent
 from .ocr import PlateOcr
 from .publisher import RabbitMqPublisher
 
+
+# force=True es necesario: paddleocr configura su propio logging (root logger) al importarse
+# ("from .ocr import PlateOcr" arriba ya lo importó transitivamente), y logging.basicConfig()
+# no hace nada si el root logger ya tiene handlers — sin "force" nuestros logs (edge.main,
+# edge.ocr) no tenían ningún handler que los mostrara, aunque sí se generaban.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True,
 )
+# El logger interno de PaddleOCR ("ppocr") es extremadamente verboso en DEBUG (una línea por cada
+# etapa de detección/clasificación/reconocimiento, por frame) — lo bajamos a WARNING para que no
+# ahogue nuestros propios logs de verificación (edge.ocr: "OCR leyó...", edge.main: "Placa
+# detectada...").
+logging.getLogger("ppocr").setLevel(logging.WARNING)
+
 logger = logging.getLogger("edge.main")
 
 

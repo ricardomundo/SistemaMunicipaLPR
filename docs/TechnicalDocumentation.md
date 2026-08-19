@@ -11,7 +11,7 @@ src/
   Core.Domain/         Entidades del dominio (POCOs), sin dependencia de EF Core
   Service.Inference/  Worker Service — consumers de CAP/RabbitMQ + cache de Redis
   Api.Web/            Web API + Auth + SignalR + AlertNotificationConsumer
-edge/                 Pipeline Edge en Python (captura OpenCV + detección YOLO + OCR EasyOCR + publish RabbitMQ) — proceso independiente, uno por cámara física
+edge/                 Pipeline Edge en Python (captura OpenCV + detección YOLO + OCR PaddleOCR + publish RabbitMQ) — proceso independiente, uno por cámara física
 ```
 
 Referencias de proyecto: `Service.Inference` → `Core.Contracts`, `Core.Domain`. `Api.Web` → `Core.Contracts`, `Core.Domain`. `edge/` no depende del backend .NET — se comunica con él únicamente publicando `PlateReadEvent` como JSON plano por AMQP a la cola `plate-read-event.raw` (ver §3 e [ImplementersGuide.md §10](ImplementersGuide.md#10-pipeline-edge-python--edge)).
@@ -66,7 +66,7 @@ Base de datos única: `SistemaLPR` (connection string `SistemaLPR` en `appsettin
 | Tabla | Columnas clave | Notas |
 |---|---|---|
 | `Camaras` | `Id` (PK identity), `Codigo` (único), `Nombre`, `Ubicacion` (`geography`, SRID 4326), `TipoInstalacion` (string: `ArcoSeguridad`\|`AvenidaAltaVelocidad`), `VelocidadMaximaKmh`, `Activa`, `CreatedAtUtc` | `Ubicacion` mapea `NetTopologySuite.Geometries.Point` — mismo sistema de coordenadas que ESRI/Google Maps |
-| `VehiculosRobados` | `Id`, `PlateText` (indexado), `NumeroReporte`, `Estado` (`Activo`\|`Recuperado`), `FechaReporteUtc`, `CreatedAtUtc`, `RecuperadoAtUtc` | Fuente de verdad de la Lista Negra; Redis solo cachea `PlateText` |
+| `VehiculosRobados` | `Id`, `PlateText` (indexado), `NumeroReporte`, `Estado` (`Activo`\|`Recuperado`), `FechaReporteUtc`, `CreatedAtUtc`, `RecuperadoAtUtc`, `ImagenPath`, `Modelo`, `Anio`, `Marca`, `Color`, `Clase`, `MarcasUOtros` (los últimos 7, nullable) | Fuente de verdad de la Lista Negra; Redis solo cachea `PlateText`. Alimentada por alta/baja manual (`BlacklistController`) y por importación masiva desde API externa/Excel/.txt (`Api.Web/Services/Blacklist/`, ver [ImplementersGuide.md §11](ImplementersGuide.md#11-alimentación-de-la-lista-negra-vehiculosrobados)) |
 | `LecturasHistoricas` | `Id` (bigint PK), `EventId` (único), `PlateText`, `CamaraId` (FK), `TimestampUtc` (indexado), `Confidence`, `ImageReference`, `EsCoincidenciaBlacklist` | Append-only. **Por default solo se registran lecturas que coinciden con la blacklist** (`EsCoincidenciaBlacklist = 1`) — no se guarda cada lectura, para no acumular información innecesaria. Configurable vía `PlateReadLogging:OnlyLogMatches` en `appsettings.json` de `Service.Inference` (default `true`); en `false`, también se registran las lecturas sin match (`EsCoincidenciaBlacklist = 0`). Ver `Service.Inference/Consumers/PlateReadConsumer.cs`. **Índice columnstore no clusterizado** `IX_LecturasHistoricas_Columnstore` sobre `(PlateText, CamaraId, TimestampUtc, Confidence, EsCoincidenciaBlacklist)` para consultas forenses/analíticas — agregado a mano vía `migrationBuilder.Sql()` en la migración `InitialLprSchema`, ya que EF Core no expone una API fluida nativa para columnstore |
 | `Alertas` | `Id` (bigint PK), `LecturaHistoricaId` (FK), `VehiculoRobadoId` (FK), `TimestampUtc`, `Estado` (`Pendiente`\|`Atendida`\|`Descartada`), `AtendidaPor`, `AtendidaAtUtc` | El único campo mutable tras la creación es el flujo de atención (`Estado`/`AtendidaPor`/`AtendidaAtUtc`); el resto del registro es inmutable |
 
@@ -105,12 +105,14 @@ Configuración en `appsettings.json`:
 | `PatrullaMovil` | `alertas` (read) |
 | `AuditorForense` | `alertas`/`camaras`/`blacklist`/`lecturas-historicas` (read) |
 
-Ejemplo de endpoint protegido: `src/Api.Web/Controllers/BlacklistController.cs`.
+Ejemplo de endpoint protegido: `src/Api.Web/Controllers/BlacklistController.cs` — alta/baja real de `VehiculoRobado` (`POST`/`DELETE /api/blacklist`), cada uno protegido con el permiso `blacklist`/`write`:
 ```csharp
 [Authorize(Policy = "Casbin")]
 [CasbinResource("blacklist", "write")]
-public IActionResult Post() => ...
+public async Task<IActionResult> Post([FromBody] CreateBlacklistEntryRequest request) => ...
 ```
+
+Tanto el alta como la baja publican `BlacklistEntryAddedEvent`/`BlacklistEntryRemovedEvent` vía `ICapPublisher` justo después de escribir en SQL, para que `BlacklistCacheService`/`BlacklistEntryAddedConsumer`/`RemovedConsumer` (en `Service.Inference`) invaliden el set de Redis de inmediato — cualquier cambio hecho fuera de esta API (p. ej. un `INSERT`/`UPDATE` directo en SQL) solo se refleja hasta el refresco delta de 5 minutos, no al instante.
 
 ## 6. Paquetes NuGet relevantes y notas de versión
 
@@ -120,7 +122,7 @@ Todos los proyectos apuntan a `net9.0`. Varios paquetes de Microsoft (`EntityFra
 |---|---|
 | `Core.Domain` | `NetTopologySuite` |
 | `Service.Inference` | `DotNetCore.CAP`, `DotNetCore.CAP.RabbitMQ`, `DotNetCore.CAP.SqlServer`, `StackExchange.Redis`, `Dapper`, `Microsoft.Data.SqlClient` |
-| `Api.Web` | `DotNetCore.CAP`, `DotNetCore.CAP.RabbitMQ`, `DotNetCore.CAP.SqlServer`, `StackExchange.Redis`, `Dapper`, `Microsoft.EntityFrameworkCore.SqlServer` (9.0.19), `Microsoft.EntityFrameworkCore.SqlServer.NetTopologySuite` (9.0.19), `Microsoft.EntityFrameworkCore.Design`/`.Tools` (9.0.19), `Microsoft.AspNetCore.SignalR.StackExchangeRedis` (9.0.19), `Microsoft.AspNetCore.Authentication.JwtBearer` (9.0.19), `Casbin.NET`, `Casbin.NET.Adapter.EFCore` |
+| `Api.Web` | `DotNetCore.CAP`, `DotNetCore.CAP.RabbitMQ`, `DotNetCore.CAP.SqlServer`, `StackExchange.Redis`, `Dapper`, `Microsoft.EntityFrameworkCore.SqlServer` (9.0.19), `Microsoft.EntityFrameworkCore.SqlServer.NetTopologySuite` (9.0.19), `Microsoft.EntityFrameworkCore.Design`/`.Tools` (9.0.19), `Microsoft.AspNetCore.SignalR.StackExchangeRedis` (9.0.19), `Microsoft.AspNetCore.Authentication.JwtBearer` (9.0.19), `Casbin.NET`, `Casbin.NET.Adapter.EFCore`, `ClosedXML` (lectura de `.xlsx` para importar la lista negra, ver [ImplementersGuide.md §11](ImplementersGuide.md#11-alimentación-de-la-lista-negra-vehiculosrobados)) |
 
 Los paquetes `DotNetCore.CAP*` están fijados a `Version="8.*"`. `RabbitMQ.Client` (usado directamente por `Service.Inference` para `PlateReadEvent`, ver [ArchitectureGuide.md §3](ArchitectureGuide.md#3-arquitectura-de-eventos-y-mensajería)) no tiene `PackageReference` explícita — se resuelve transitivamente vía `DotNetCore.CAP.RabbitMQ`.
 
@@ -131,10 +133,12 @@ Los paquetes `DotNetCore.CAP*` están fijados a `Version="8.*"`. `RabbitMQ.Clien
 - [x] Contratos de eventos (`Core.Contracts`)
 - [x] Entidades + `LprDbContext` + migración inicial con índice columnstore (`Core.Domain`, Fase 1)
 - [x] `BlacklistCacheService` (carga inicial + invalidación event-driven + refresco delta) — Fase 2
+- [x] `BlacklistController` (alta/baja real de `VehiculoRobado`, con invalidación inmediata de Redis vía CAP) — Fase 3
+- [x] Alimentación masiva de la lista negra (`Api.Web/Services/Blacklist/`: import Excel/.txt vía `POST /api/blacklist/import`, reconciliación por placa) — Fase 3. Sincronización con API externa dejada lista (`ExternalBlacklistSyncService`) pero con un placeholder — el servicio externo real todavía no existe
 - [x] Consumers de `PlateReadEvent` (RabbitMQ.Client directo), `BlacklistHitPersistenceConsumer` (Dapper, vía CAP), `AlertNotificationConsumer` (vía CAP) — Fase 2
 - [x] `AlertHub` (SignalR) — Fase 2
-- [x] Simulador de carga (`tools/LoadSimulator`, 50 cámaras × 10 lecturas/seg) — Fase 3
-- [ ] Pipeline Edge Python (YOLO + OpenCV + EasyOCR + buffer SQLite) — Fase 3, código construido y validado de forma aislada; sin modelo de detección de placas ni prueba contra cámara real todavía (ver [ImplementersGuide.md §10](ImplementersGuide.md#10-pipeline-edge-python--edge))
+- [x] Simulador de carga (`tools/LoadSimulator`, 50 cámaras × 10 lecturas/seg) — Fase 3, construido; validación de latencia bajo carga (<300ms) todavía pendiente de confirmar
+- [x] Pipeline Edge Python (YOLO + OpenCV + PaddleOCR + buffer SQLite) — Fase 3, verificado end-to-end contra un video de prueba real (detección → OCR → publish → persistencia → alerta); sin uploader de imágenes a storage central todavía (ver [ImplementersGuide.md §10](ImplementersGuide.md#10-pipeline-edge-python--edge))
 - [ ] Frontend C4 (React/Angular + mapa ESRI/Google Maps) — no iniciado
 
 > Fase 0, Pre-Fase 1, Fase 1 y Fase 2 están verificadas de punta a punta contra servicios reales (ver `fases.md`). El siguiente trabajo real es completar Fase 3.

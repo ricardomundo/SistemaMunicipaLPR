@@ -23,12 +23,15 @@ coincide, este es el primer lugar a revisar.
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 from paddleocr import PaddleOCR
+
+logger = logging.getLogger("edge.ocr")
 
 _NORMALIZE_PATTERN = re.compile(r"[^A-Z0-9]")
 
@@ -76,10 +79,20 @@ class PlateOcr:
         _, (text, confidence) = max(lines, key=lambda line: line[1][1])
 
         normalized = normalize_plate_text(text)
+        # INFO (no debug): visible por default en consola, para poder verificar en vivo qué está
+        # leyendo el OCR — incluye lecturas que luego se descartan, para distinguir "no detectó
+        # nada" de "detectó algo pero no pasó el umbral/patrón".
+        logger.info("OCR leyó '%s' -> normalizado '%s' (confianza=%.2f).", text, normalized, confidence)
+
         if not normalized or confidence < self._min_confidence:
+            logger.info(
+                "Descartado: confianza %.2f < mínimo configurado %.2f, o texto vacío tras normalizar.",
+                confidence, self._min_confidence,
+            )
             return None
 
         if self._plate_pattern is not None and not self._plate_pattern.match(normalized):
+            logger.info("Descartado: '%s' no coincide con ocr.plate_pattern configurado.", normalized)
             return None
 
         return OcrResult(text=normalized, confidence=float(confidence))

@@ -31,6 +31,12 @@ public class LprDbContext(DbContextOptions<LprDbContext> options) : DbContext(op
             entity.HasIndex(v => v.PlateText);
             entity.Property(v => v.NumeroReporte).HasMaxLength(50).IsRequired();
             entity.Property(v => v.Estado).HasConversion<string>().HasMaxLength(20);
+            entity.Property(v => v.ImagenPath).HasMaxLength(500);
+            entity.Property(v => v.Modelo).HasMaxLength(100);
+            entity.Property(v => v.Marca).HasMaxLength(100);
+            entity.Property(v => v.Color).HasMaxLength(50);
+            entity.Property(v => v.Clase).HasMaxLength(50);
+            entity.Property(v => v.MarcasUOtros).HasMaxLength(500);
         });
 
         modelBuilder.Entity<LecturaHistorica>(entity =>

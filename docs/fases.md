@@ -57,7 +57,7 @@
 
 **Entregado y verificado end-to-end:**
 1. `BlacklistCacheService` (`IHostedService`, en `Service.Inference`): carga inicial de `VehiculosRobados.Estado = Activo` al set de Redis `blacklist:active-plates` al arrancar, y refresco delta completo cada 5 min como respaldo.
-2. `BlacklistEntryAddedConsumer`/`BlacklistEntryRemovedConsumer` (`Service.Inference`): invalidación inmediata del set de Redis al recibir `BlacklistEntryAddedEvent`/`RemovedEvent`. (`BlacklistController` en `Api.Web` sigue siendo un stub — el alta/baja real de `VehiculoRobado` queda fuera del alcance de Fase 2.)
+2. `BlacklistEntryAddedConsumer`/`BlacklistEntryRemovedConsumer` (`Service.Inference`): invalidación inmediata del set de Redis al recibir `BlacklistEntryAddedEvent`/`RemovedEvent`. (El alta/baja real de `VehiculoRobado` que dispara estos eventos —`BlacklistController` en `Api.Web`— se implementó en Fase 3, ver abajo.)
 3. `PlateReadConsumer` (`Service.Inference`): consume `PlateReadEvent` directo de RabbitMQ (fuera del outbox de CAP, por volumen — ver [ArchitectureGuide.md §3](ArchitectureGuide.md#3-arquitectura-de-eventos-y-mensajería)), hace un lookup O(1) contra Redis y, si hay match, publica `BlacklistHitSavedEvent` vía DotNetCore.CAP.
 4. `BlacklistHitPersistenceConsumer` (`Service.Inference`): suscriptor de CAP de `BlacklistHitSavedEvent` — resuelve `CamaraId`/`VehiculoRobadoId` e inserta `LecturaHistorica` + `Alerta` vía Dapper, deduplicando por `EventId`.
 5. `AlertNotificationConsumer` (`Api.Web`): otro suscriptor de CAP, independiente, del mismo `BlacklistHitSavedEvent` — empuja la alerta a `AlertHub` por SignalR.
@@ -83,16 +83,32 @@
 - Buffer local en SQLite + hilo de drenado en background para tolerancia a cortes de red.
 - Diseño y uso detallados en [ImplementersGuide.md §10](ImplementersGuide.md#10-pipeline-edge-python--edge).
 
-**En progreso — modelo de detección de placas:** el pipeline Edge no incluye un modelo todavía. Se está preparando uno propio para placas mexicanas: dataset "full-plate-dataset" (workspace `cv-0zohq` en Roboflow, versión 1) descargado en formato YOLOv8 vía `roboflow` a una carpeta `training/` (fuera de `edge/`, que es solo el runtime), para entrenar con `ultralytics` (`yolo detect train ... model=yolov8n.pt`) y copiar el resultado (`best.pt`) a `edge/models/plate_detector.pt`.
+**En progreso — modelo de detección de placas:** el pipeline Edge no incluye un modelo todavía. Se evaluaron varios candidatos locales además del dataset de Roboflow:
+
+- `Car-License-Detection/best.pt` — YOLOv8, clase única de placa, entrenado sobre un dataset genérico de Kaggle (433 imágenes, no específico de México). Carga directa con `ultralytics.YOLO(path)`, sin dependencias ni arquitectura especial — compatible tal cual con `edge/src/detector.py`. Candidato más rápido de probar.
+- `License-Plate-Detector/` — descartado: es un fork chino (zeusees) de YOLOv5 con cabeza de salida custom (landmarks/esquinas, estilo yolov5-face) para clasificar tipos de placa chinos por color (azul, amarilla, verde de nuevas energías, etc.). Incompatible tanto en arquitectura (no es un `ultralytics.YOLO` estándar) como en dominio (placas chinas, no mexicanas).
+- `CarRecognition/` — descartado: es una app Android (Gradle), sin relación con detección de placas.
+- `Custom Workflow Object Detection.v2i.yolov8/` — dataset YOLOv8 ya extraído (no zip), del workspace Roboflow `placasmexicanas`, 101 imágenes (train/valid/test) etiquetadas específicamente sobre placas mexicanas. Dos clases (`placa`, `placa1` — pendiente confirmar en Roboflow qué distingue una de otra). Por su tamaño (101 imágenes) sirve mejor para *fine-tuning* de un modelo ya entrenado que para entrenar uno desde cero.
+- `training/Full-Plate-Dataset-1/roboflow.zip` — descarga previa desde Roboflow (`cv-0zohq`/`full-plate-dataset`), quedó sin extraer correctamente; sigue pendiente si se decide no usar las alternativas de arriba.
+
+**Decisión:** `Car-License-Detection/best.pt` se probó contra fotos reales de placas mexicanas (prueba visual con `yolo predict`, fuera del pipeline) y detecta bien — se adopta como modelo de detección, sin necesidad de fine-tuning ni de retomar `full-plate-dataset`/`placasmexicanas` por ahora. Esos dos datasets quedan como opción de respaldo si más adelante aparecen casos donde falle (ángulos, distancia, placas dobles, etc.).
+
+**Verificado end-to-end:** primera corrida completa del pipeline Edge contra un video de prueba real — captura (OpenCV) → detección (`Car-License-Detection/best.pt` copiado a `edge/models/plate_detector.pt`) → OCR (PaddleOCR) → publish a `plate-read-event.raw` → `PlateReadConsumer` → lookup en Redis → `BlacklistHitSavedEvent` (CAP) → `BlacklistHitPersistenceConsumer` → alerta registrada en SQL. Requiere Python 3.11 para el venv de `edge/` (ver [ImplementersGuide.md §10](ImplementersGuide.md#10-pipeline-edge-python--edge)).
+
+**Entregado — `BlacklistController` (`Api.Web`):** alta (`POST /api/blacklist`) y baja (`DELETE /api/blacklist/{plateText}`) real de `VehiculoRobado`, protegidos con el permiso `blacklist`/`write` (Casbin). Cada alta/baja publica `BlacklistEntryAddedEvent`/`BlacklistEntryRemovedEvent` vía CAP, invalidando el caché de Redis de inmediato en vez de esperar el refresco delta de 5 min. El texto de placa se normaliza (mayúsculas, sin guiones/espacios) con el mismo criterio que usa el OCR del pipeline Edge, para garantizar match exacto.
+
+**Confirmado:** `dotnet build` de la solución completa compila limpio — el fix de la API async de RabbitMQ.Client 7.x y el nuevo `BlacklistController` ya están verificados contra el proyecto real.
+
+**Entregado — alimentación de la lista negra (`Api.Web/Services/Blacklist/`):** la lista negra se alimenta de tres fuentes que traen los mismos datos (confirmado con el negocio) — una API externa, archivos Excel y archivos `.txt` — reconciliadas por placa en un solo servicio compartido (`BlacklistImportService`). `VehiculoRobado` creció con 7 columnas descriptivas nullable (`ImagenPath`, `Modelo`, `Anio`, `Marca`, `Color`, `Clase`, `MarcasUOtros`). El import de Excel/.txt es un endpoint nuevo (`POST /api/blacklist/import`); la sincronización con la API externa quedó lista como worker periódico (`ExternalBlacklistSyncService`) pero con un placeholder, porque ese servicio externo todavía no existe. Detalle completo en [ImplementersGuide.md §11](ImplementersGuide.md#11-alimentación-de-la-lista-negra-vehiculosrobados).
+
+**Confirmado:** migración de EF Core generada/aplicada y `dotnet build` limpio con las columnas nuevas de `VehiculosRobados` y el paquete `ClosedXML`.
 
 **Para retomar:**
-1. **Primero** buscar si ya existe un modelo de detección de placas pre-entrenado y descargable (pestaña "Deploy"/"Model" del proyecto en Roboflow, o algún repo público con pesos `.pt` ya listos) — evita el entrenamiento si algo así sirve tal cual. `full-plate-dataset` (lo que ya se descargó) es un **dataset** (imágenes + etiquetas), no pesos entrenados — solo sirve como insumo para entrenar, no como atajo.
-2. Si no aparece nada usable ya entrenado: confirmar que la descarga del dataset (`training/download_dataset.py`) terminó bien y revisar el `data.yaml` generado (nombre de la(s) clase(s), cantidad de imágenes), luego entrenar con `ultralytics` (`yolo detect train data=... model=yolov8n.pt epochs=100 imgsz=640 batch=16`) y copiar `runs/detect/train/weights/best.pt` a `edge/models/plate_detector.pt`.
-3. Configurar `edge/config.yaml` (copiado de `config.example.yaml`) y correr `python -m src.main` contra una cámara/video de prueba con el stack de `docker-compose.yml` arriba — primera vez que el pipeline Edge corre de punta a punta contra hardware/modelo real.
-4. Confirmar que `dotnet build` de la solución completa (incluyendo `tools/VerifyFase2`, `tools/LoadSimulator` y `src/Service.Inference`) compila limpio tras el fix de la API async de RabbitMQ.Client 7.x — se corrigió pero no se confirmó una recompilación exitosa después del último ajuste.
-5. Con el build confirmado, volver a correr `tools/LoadSimulator` para validar por fin la latencia cámara→alerta bajo carga (<300ms) — el objetivo original de esta mitad de Fase 3, todavía sin confirmar.
-6. Diseñar el uploader de imágenes de placa hacia un storage central (hoy solo se guardan en disco local del nodo Edge).
-7. Rotar la API key de Roboflow usada para descargar el dataset (quedó expuesta en texto plano durante esta sesión de trabajo).
+1. Probar `POST /api/blacklist/import` con un archivo real (Excel o .txt) de alguna de las tres fuentes — se escribió sin tener un archivo de muestra a la mano; si alguna columna no matchea, ajustar `ColumnAliases` en `TabularBlacklistFileParser.cs`.
+2. Definir el spec real de la API externa (endpoint, autenticación, formato) para reemplazar `PlaceholderExternalBlacklistSource` por la implementación real.
+3. Correr `tools/LoadSimulator` para validar por fin la latencia cámara→alerta bajo carga (<300ms) — el objetivo original de esta mitad de Fase 3, todavía sin confirmar.
+4. Diseñar el uploader de imágenes de placa hacia un storage central (hoy solo se guardan en disco local del nodo Edge).
+5. Rotar la API key de Roboflow usada para descargar el dataset (quedó expuesta en texto plano durante esta sesión de trabajo).
 
 ---
 

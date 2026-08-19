@@ -4,6 +4,7 @@ using Api.Web.Authorization;
 using Api.Web.Consumers;
 using Api.Web.Data;
 using Api.Web.Hubs;
+using Api.Web.Services.Blacklist;
 using Casbin;
 using Casbin.Persist;
 using Casbin.Persist.Adapter.EFCore;
@@ -140,6 +141,18 @@ builder.Services.AddCap(x =>
 
     x.DefaultGroupName = "api-web";
 });
+
+// --- Fase 3: alimentación de la lista negra (VehiculosRobados) desde múltiples fuentes que
+// traen los mismos datos (API externa, Excel, .txt) — ver ImplementersGuide.md §11.
+// IBlacklistImportService concentra la reconciliación por placa (alta/baja/actualización) que
+// usan tanto el import manual de archivos (BlacklistController.Import) como la sincronización
+// periódica con la fuente externa (ExternalBlacklistSyncService).
+builder.Services.AddScoped<IBlacklistImportService, BlacklistImportService>();
+// PlaceholderExternalBlacklistSource: el servicio externo real todavía no existe (no hay
+// endpoint/auth/formato definidos) — reemplazar esta línea por la implementación real en cuanto
+// se tenga el spec, sin tocar ExternalBlacklistSyncService ni el resto del pipeline.
+builder.Services.AddSingleton<IExternalBlacklistSource, PlaceholderExternalBlacklistSource>();
+builder.Services.AddHostedService<ExternalBlacklistSyncService>();
 
 var app = builder.Build();
 

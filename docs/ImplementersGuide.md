@@ -131,7 +131,7 @@ Ninguna de las dos está registrada en `SistemaLPR.sln` (convención del repo pa
 
 ### `tools/VerifyFase2`
 
-Verifica a mano el camino completo de Fase 2 (no hay todavía ningún publisher real de `PlateReadEvent` fuera de este tool y de `tools/LoadSimulator`, ni un flujo real de alta/baja de `VehiculoRobado` — `BlacklistController` sigue siendo un stub).
+Verifica a mano el camino completo de Fase 2 (no hay todavía ningún publisher real de `PlateReadEvent` fuera de este tool, `tools/LoadSimulator` y el pipeline Edge — el alta/baja real de `VehiculoRobado` sí está implementada, en `BlacklistController` (`POST`/`DELETE /api/blacklist`), ver [TechnicalDocumentation.md §5](TechnicalDocumentation.md#5-autenticación-y-autorización)).
 
 ```powershell
 cd C:\Ric68\SistemaMunicipaLPR\tools\VerifyFase2
@@ -189,8 +189,13 @@ edge/
 ```
 
 **Instalación y ejecución:**
-```bash
+
+Requiere **Python 3.11** específicamente para el entorno virtual de `edge/` — `paddlepaddle` (dependencia de `paddleocr`) no publica wheels para versiones de Python muy recientes (confirmado: falla con `(from versions: none)` en Python 3.14), y 3.11 es la versión con mejor soporte actual en todo el stack (`ultralytics`, `paddleocr`/`paddlepaddle`, `opencv-python`). En Windows, si tu Python por default es otra versión, usa el lanzador `py` para crear el venv con la versión correcta:
+
+```powershell
 cd edge
+py -3.11 -m venv venv
+venv\Scripts\Activate.ps1
 cp config.example.yaml config.yaml   # ajustar camera.id, camera.source, credenciales de RabbitMQ, etc.
 pip install -r requirements.txt
 python -m src.main
@@ -200,7 +205,7 @@ python -m src.main
 
 **Por qué PaddleOCR y no EasyOCR:** mismo alfabeto latino A-Z0-9 para placas mexicanas — no hay diferencia real de "idioma" entre ambos motores para este caso. Se eligió PaddleOCR por su tolerancia reportada a ruido/blur en video de vigilancia. Costo real a tener en cuenta: el proceso Edge ahora carga dos frameworks de ML distintos en memoria (PyTorch vía `ultralytics` para el detector, PaddlePaddle vía `paddleocr` para el texto) — más huella de RAM/disco en el Jetson que si ambas etapas compartieran framework. Si eso resulta un problema en hardware real, `ocr.py` es la única pieza que habría que volver a cambiar (misma interfaz pública `PlateOcr.read()`, así que el resto del pipeline no se ve afectado). `requirements.txt` fija `paddleocr<3` a propósito — la serie 3.x reescribió buena parte de la API pública (`.predict()` en vez de `.ocr()`), y este código está escrito contra la clásica 2.x, sin poder verificar contra el paquete real instalado (sin acceso a PyPI desde donde se escribió).
 
-**Modelo de detección de placas:** no se entrena uno desde cero — busca en Roboflow Universe (`universe.roboflow.com`) proyectos públicos de "license plate detection", descarga los pesos `.pt` y pruébalos directo contra tus cámaras antes de pensar en afinar/entrenar algo propio. Detectar dónde está una placa depende poco del país (es un rectángulo con cierta proporción); lo que sí es específico de México (colores/diseños por estado, formato de dos líneas en motos) importa más si decides afinar el modelo con tus propios datos más adelante que para el intento inicial con un modelo público.
+**Modelo de detección de placas:** se usa un YOLOv8 público ya entrenado para detección de placas (una sola clase), copiado a `edge/models/plate_detector.pt` — probado visualmente contra fotos reales de placas mexicanas y confirmado que detecta bien, sin necesidad de afinarlo. Detectar dónde está una placa depende poco del país (es un rectángulo con cierta proporción); lo que sí es específico de México (colores/diseños por estado, formato de dos líneas en motos) solo importaría si más adelante aparecen casos donde este modelo falle y haga falta afinarlo con datos propios.
 
 **Publish:** igual que el lado .NET, `PlateReadEvent` viaja como JSON plano (AMQP puro, vía `pika`) a la cola durable `plate-read-event.raw` — sin ningún envelope de CAP que replicar (esa es la simplificación que dejó el cambio de diseño de Fase 3, ver [ArchitectureGuide.md §3](ArchitectureGuide.md#3-arquitectura-de-eventos-y-mensajería)). Los nombres de campo del JSON (`events.py`) deben coincidir EXACTO en casing con el record de C# — `System.Text.Json` deserializa sin `PropertyNameCaseInsensitive`.
 
@@ -211,3 +216,38 @@ python -m src.main
 - **Sin uploader de imágenes a un storage central.** Los recortes de placa se guardan solo en disco local del nodo Edge (`images.save_dir`); `ImageReference` apunta a esa ruta local. No hay todavía ninguna pieza que suba esas imágenes a un storage accesible desde el backend/dashboard — hace falta diseñarla y construirla antes de que `ImageReference` sea útil fuera del propio nodo Edge.
 - **Despliegue en Jetson:** `pip install ultralytics` en un entorno genérico trae wheels de PyTorch que no aprovechan la GPU del Jetson — en Jetson real hace falta instalar primero el PyTorch específico de NVIDIA para la versión de JetPack instalada (ver comentario en `requirements.txt`).
 - **Sin verificar contra hardware real:** este código se escribió y se probó de forma aislada (config, serialización del evento, buffer SQLite, manejo de fallo de conexión a RabbitMQ) en un entorno sin cámara ni GPU — los módulos de captura/detección/OCR (`capture.py`, `detector.py`, `ocr.py`) no se han ejecutado todavía contra una cámara, un stream RTSP real, ni un modelo de placas entrenado. Primer paso al retomar: conseguir un modelo de detección de placas, conectar una cámara de prueba, y correr `python -m src.main` de punta a punta contra el RabbitMQ real del `docker-compose.yml`.
+
+## 11. Alimentación de la lista negra (`VehiculosRobados`)
+
+Además del alta/baja manual de `BlacklistController` (uno a la vez, ver [TechnicalDocumentation.md §5](TechnicalDocumentation.md#5-autenticación-y-autorización)), la lista negra se alimenta de tres fuentes que traen los mismos datos: una API externa, archivos Excel y archivos `.txt`. Todas convergen en el mismo tipo canónico y la misma lógica de reconciliación, en `Api.Web/Services/Blacklist/`:
+
+```
+Api.Web/Services/Blacklist/
+  PlateTextNormalizer.cs           # mismo criterio de normalización que edge/src/ocr.py
+  BlacklistImportRecord.cs         # tipo canónico + resultado/resumen de importación
+  IBlacklistImportService.cs
+  BlacklistImportService.cs        # reconciliación por placa (alta/baja/actualización)
+  TabularBlacklistFileParser.cs    # lee .xlsx (ClosedXML) o .txt/.csv delimitado
+  IExternalBlacklistSource.cs      # + PlaceholderExternalBlacklistSource
+  ExternalBlacklistSyncService.cs  # BackgroundService, sincroniza cada 15 min
+```
+
+**Campos del tipo canónico (`BlacklistImportRecord`):** `PlateText`, `NumeroReporte`, `FechaReporteUtc`, `BusquedaActiva` (bool — true = activo/alta, false = recuperado/baja), `ImagenPath`, `Modelo`, `Anio`, `Marca` (algunas fuentes lo llaman "Vendor"), `Color`, `Clase`, `MarcasUOtros`. Los últimos siete son opcionales — `VehiculoRobado` los guarda como columnas nullable en `VehiculosRobados`.
+
+**Reconciliación por placa (`BlacklistImportService.UpsertAsync`):** a diferencia del `POST` manual (que rechaza con 409 si la placa ya está activa), el import es idempotente — pensado para poder re-subir el mismo archivo, o uno más reciente de la misma fuente, sin generar duplicados:
+- `BusquedaActiva=true` y no hay reporte activo para esa placa → alta (publica `BlacklistEntryAddedEvent`).
+- `BusquedaActiva=true` y ya hay uno activo → actualiza los campos descriptivos que vinieron distintos (sin volver a publicar el evento — Redis ya tiene la placa).
+- `BusquedaActiva=false` y hay uno activo → baja (`Estado=Recuperado`, publica `BlacklistEntryRemovedEvent`).
+- `BusquedaActiva=false` y no hay ninguno activo → no hace nada (no es un error).
+
+**Excel/.txt — `POST /api/blacklist/import`** (multipart, campo `file`, protegido con `blacklist`/`write`): `TabularBlacklistFileParser` mapea columnas por NOMBRE de encabezado (no por posición), con una tabla de alias por campo (ej. `Anio` acepta las columnas `Anio`/`Ano`/`Año`; `Marca` acepta `Vendor`/`Marca`/`Fabricante`). El `.txt` detecta el delimitador (tab/`;`/`,`/`|`) contando cuál aparece más veces en el encabezado. **Escrito sin un archivo de muestra real de ninguna de las tres fuentes** — si al probar con un archivo real alguna columna no matchea ningún alias, agregarlo a `ColumnAliases` en ese archivo es el único cambio necesario. La respuesta es un resumen (`BlacklistImportSummary`) con conteos por tipo de resultado y el detalle fila por fila.
+
+**API externa — `IExternalBlacklistSource`:** el servicio real todavía no existe (sin endpoint/autenticación/formato definidos). `PlaceholderExternalBlacklistSource` devuelve una lista vacía para que `ExternalBlacklistSyncService` (`BackgroundService`, corre cada 15 min, registrado en `Program.cs` de `Api.Web`) pueda quedar activo sin romper el arranque. En cuanto exista el spec real, la única pieza que hay que reemplazar es esa implementación — el resto (reconciliación, invalidación de Redis) no cambia.
+
+**Pendiente de correr tras este cambio:** el esquema de `VehiculosRobados` creció (7 columnas nuevas nullable) — hace falta generar y aplicar la migración:
+```bash
+dotnet ef migrations add AddVehiculoRobadoDetalles --project src/Api.Web --context LprDbContext
+dotnet ef database update --project src/Api.Web --context LprDbContext
+```
+También se agregó el paquete `ClosedXML` a `Api.Web.csproj` (lectura de `.xlsx`) — su versión no se pudo verificar contra NuGet real al escribir esto; si `dotnet restore`/`dotnet build` no la encuentra, ajustar al último `0.104.x` publicado.
+

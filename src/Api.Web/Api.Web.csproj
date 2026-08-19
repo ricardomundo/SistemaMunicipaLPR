@@ -9,6 +9,11 @@
   <ItemGroup>
     <PackageReference Include="Casbin.NET" Version="2.21.3" />
     <PackageReference Include="Casbin.NET.Adapter.EFCore" Version="2.12.0" />
+    <!-- Lectura de archivos .xlsx para la importación masiva de la lista negra (ver
+         ImplementersGuide.md §11). MIT license, sin dependencia de Excel/Interop instalado.
+         Versión sin verificar contra NuGet real (sin acceso a internet desde donde se escribió
+         esto) — si "dotnet restore" no la encuentra, ajustar al último 0.104.x publicado. -->
+    <PackageReference Include="ClosedXML" Version="0.104.2" />
     <PackageReference Include="Dapper" Version="2.1.79" />
     <!-- Fase 2 migró de MassTransit a DotNetCore.CAP (2026-08-18): MassTransit 9.x exige
          SetLicense/MT_LICENSE incluso para uso local, y bajar a 8.x resultaba en depender de

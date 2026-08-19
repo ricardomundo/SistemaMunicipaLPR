@@ -25,3 +25,9 @@ paddlepaddle>=2.5,<3
 pika>=1.3,<2
 PyYAML>=6.0,<7
 numpy>=1.26,<2
+
+# Requerido para cargar edge/models/plate_detector.pt (Car-License-Detection/best.pt): el
+# checkpoint se guardó (pickle) con una dependencia de "dill" desde el entorno donde se entrenó
+# (típico de notebooks de Kaggle/Colab). Ultralytics la detecta y la instalaría solo vía
+# AutoInstall al cargar el modelo si falta, pero se fija aquí para no depender de eso.
+dill

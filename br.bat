@@ -1,1 +1,0 @@
-curl.exe -X POST http://localhost:8080/realms/sistema-lpr/protocol/openid-connect/token -d "client_id=api-web" -d "client_secret=vohSIsyCFaB5L9hz2YdZ3fZtUvYBq4BO"   -d "grant_type=password"   -d "username=operador.test"   -d "password=Generico2026$"
