@@ -211,11 +211,13 @@ python -m src.main
 
 **Tolerancia a cortes de red:** si el publish directo falla, el evento se guarda en un buffer local SQLite (`buffer.db`) en vez de perderse; un hilo de fondo lo drena hacia RabbitMQ en cuanto la conexión vuelve, en el mismo orden en que se generaron los eventos.
 
+**Probar sin cámara IP física:** ver [vlcTests.md](vlcTests.md) — VLC puede emitir un video de prueba como stream RTSP, que `camera.source` consume igual que una cámara real, sin necesidad de esperar a un despliegue de campo.
+
 **Gaps conocidos, sin resolver todavía:**
 - **No incluye un modelo de detección de placas.** Un YOLO preentrenado en COCO no tiene clase de "placa" — hace falta conseguir un modelo público ya entrenado para esto o entrenar uno propio, y colocarlo en `edge/models/`. Sin ese archivo, `main.py` se niega a arrancar (falla rápido con un mensaje explícito en vez de correr sin detectar nada).
 - **Sin uploader de imágenes a un storage central.** Los recortes de placa se guardan solo en disco local del nodo Edge (`images.save_dir`); `ImageReference` apunta a esa ruta local. No hay todavía ninguna pieza que suba esas imágenes a un storage accesible desde el backend/dashboard — hace falta diseñarla y construirla antes de que `ImageReference` sea útil fuera del propio nodo Edge.
 - **Despliegue en Jetson:** `pip install ultralytics` en un entorno genérico trae wheels de PyTorch que no aprovechan la GPU del Jetson — en Jetson real hace falta instalar primero el PyTorch específico de NVIDIA para la versión de JetPack instalada (ver comentario en `requirements.txt`).
-- **Sin verificar contra hardware real:** este código se escribió y se probó de forma aislada (config, serialización del evento, buffer SQLite, manejo de fallo de conexión a RabbitMQ) en un entorno sin cámara ni GPU — los módulos de captura/detección/OCR (`capture.py`, `detector.py`, `ocr.py`) no se han ejecutado todavía contra una cámara, un stream RTSP real, ni un modelo de placas entrenado. Primer paso al retomar: conseguir un modelo de detección de placas, conectar una cámara de prueba, y correr `python -m src.main` de punta a punta contra el RabbitMQ real del `docker-compose.yml`.
+- **Sin verificar contra una cámara IP física ni un Jetson real todavía.** Ya está verificado end-to-end contra un video de prueba y, más recientemente, contra un stream RTSP simulado con VLC (ver [vlcTests.md](vlcTests.md)) — ambos corriendo en una máquina de desarrollo normal, sin GPU dedicada ni el hardware Jetson objetivo. Falta la verificación final contra una cámara IP física y el nodo Jetson desplegado en campo.
 
 ## 11. Alimentación de la lista negra (`VehiculosRobados`)
 
@@ -228,7 +230,10 @@ Api.Web/Services/Blacklist/
   IBlacklistImportService.cs
   BlacklistImportService.cs        # reconciliación por placa (alta/baja/actualización)
   TabularBlacklistFileParser.cs    # lee .xlsx (ClosedXML) o .txt/.csv delimitado
-  IExternalBlacklistSource.cs      # + PlaceholderExternalBlacklistSource
+  IExternalBlacklistSource.cs
+  ExternalBlacklistApiOptions.cs   # config: BaseUrl (appsettings.json) + BearerToken (user-secrets/env)
+  ExternalBlacklistAuthHandler.cs  # DelegatingHandler: agrega "Authorization: Bearer {token}"
+  HttpExternalBlacklistSource.cs   # implementación real: GET + mapeo del JSON al tipo canónico
   ExternalBlacklistSyncService.cs  # BackgroundService, sincroniza cada 15 min
 ```
 
@@ -240,9 +245,22 @@ Api.Web/Services/Blacklist/
 - `BusquedaActiva=false` y hay uno activo → baja (`Estado=Recuperado`, publica `BlacklistEntryRemovedEvent`).
 - `BusquedaActiva=false` y no hay ninguno activo → no hace nada (no es un error).
 
-**Excel/.txt — `POST /api/blacklist/import`** (multipart, campo `file`, protegido con `blacklist`/`write`): `TabularBlacklistFileParser` mapea columnas por NOMBRE de encabezado (no por posición), con una tabla de alias por campo (ej. `Anio` acepta las columnas `Anio`/`Ano`/`Año`; `Marca` acepta `Vendor`/`Marca`/`Fabricante`). El `.txt` detecta el delimitador (tab/`;`/`,`/`|`) contando cuál aparece más veces en el encabezado. **Escrito sin un archivo de muestra real de ninguna de las tres fuentes** — si al probar con un archivo real alguna columna no matchea ningún alias, agregarlo a `ColumnAliases` en ese archivo es el único cambio necesario. La respuesta es un resumen (`BlacklistImportSummary`) con conteos por tipo de resultado y el detalle fila por fila.
+**Excel/.txt — `POST /api/blacklist/import`** (multipart, campo `file`, protegido con `blacklist`/`write`): `TabularBlacklistFileParser` mapea columnas por NOMBRE de encabezado (no por posición), con una tabla de alias por campo (ej. `Anio` acepta las columnas `Anio`/`Ano`/`Año`; `Marca` acepta `Vendor`/`Marca`/`Fabricante`). El `.txt` detecta el delimitador (tab/`;`/`,`/`|`) contando cuál aparece más veces en el encabezado. Verificado contra un archivo `.txt` real delimitado por `;`. La respuesta es un resumen (`BlacklistImportSummary`) con conteos por tipo de resultado y el detalle fila por fila.
 
-**API externa — `IExternalBlacklistSource`:** el servicio real todavía no existe (sin endpoint/autenticación/formato definidos). `PlaceholderExternalBlacklistSource` devuelve una lista vacía para que `ExternalBlacklistSyncService` (`BackgroundService`, corre cada 15 min, registrado en `Program.cs` de `Api.Web`) pueda quedar activo sin romper el arranque. En cuanto exista el spec real, la única pieza que hay que reemplazar es esa implementación — el resto (reconciliación, invalidación de Redis) no cambia.
+**API externa — `IExternalBlacklistSource` / `HttpExternalBlacklistSource`:** un GET simple a `ExternalBlacklist:BaseUrl` (appsettings.json), autenticado con un bearer token estático que el cliente ya entregó. El endpoint regresa siempre el catálogo completo de reportes (activos e inactivos, con `busquedaActiva` explícito por registro) — no hay noción de "cambios desde X", así que `ExternalBlacklistSyncService` (`BackgroundService`, corre cada 15 min) simplemente reprocesa el arreglo completo por `IBlacklistImportService.UpsertAsync` en cada ciclo, que ya es idempotente. Forma del JSON (confirmada con un ejemplo real del cliente):
+
+```json
+[{"placa":"ABC1234","numeroReporte":"REP-2026-001","fechaReporte":"2026-08-15","busquedaActiva":true,"imagenCarro":"","modelo":"Aveo","anio":2019,"vendor":"Chevrolet","color":"Rojo","clase":"Carro","marcasUotros":""}]
+```
+
+`vendor` mapea a `Marca` en el tipo canónico, igual que en `TabularBlacklistFileParser`. Verificado end-to-end contra el endpoint real del cliente. Configuración:
+- `ExternalBlacklist:BaseUrl` — la URL real, en `appsettings.json` (no es secreto). Si en algún ambiente todavía no se tiene la URL definitiva, dejarla como `TODO-configurar-URL-real-del-endpoint-GET`: `HttpExternalBlacklistSource` detecta ese placeholder, loguea una advertencia y omite el ciclo en vez de fallar.
+- `ExternalBlacklist:BearerToken` — el token que ya entregó el cliente. **Nunca va en `appsettings.json` ni en ningún archivo versionado** (mismo criterio que evitó el incidente del `client_secret` de Keycloak en `br.bat`, ver §8). Configurarlo con:
+  ```bash
+  dotnet user-secrets init --project src/Api.Web
+  dotnet user-secrets set "ExternalBlacklist:BearerToken" "EL_TOKEN_REAL" --project src/Api.Web
+  ```
+  En otros ambientes, vía variable de entorno `ExternalBlacklist__BearerToken` (doble guion bajo — convención de `IConfiguration` para anidar secciones).
 
 **Pendiente de correr tras este cambio:** el esquema de `VehiculosRobados` creció (7 columnas nuevas nullable) — hace falta generar y aplicar la migración:
 ```bash
@@ -250,4 +268,3 @@ dotnet ef migrations add AddVehiculoRobadoDetalles --project src/Api.Web --conte
 dotnet ef database update --project src/Api.Web --context LprDbContext
 ```
 También se agregó el paquete `ClosedXML` a `Api.Web.csproj` (lectura de `.xlsx`) — su versión no se pudo verificar contra NuGet real al escribir esto; si `dotnet restore`/`dotnet build` no la encuentra, ajustar al último `0.104.x` publicado.
-

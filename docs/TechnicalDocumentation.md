@@ -134,7 +134,7 @@ Los paquetes `DotNetCore.CAP*` están fijados a `Version="8.*"`. `RabbitMQ.Clien
 - [x] Entidades + `LprDbContext` + migración inicial con índice columnstore (`Core.Domain`, Fase 1)
 - [x] `BlacklistCacheService` (carga inicial + invalidación event-driven + refresco delta) — Fase 2
 - [x] `BlacklistController` (alta/baja real de `VehiculoRobado`, con invalidación inmediata de Redis vía CAP) — Fase 3
-- [x] Alimentación masiva de la lista negra (`Api.Web/Services/Blacklist/`: import Excel/.txt vía `POST /api/blacklist/import`, reconciliación por placa) — Fase 3. Sincronización con API externa dejada lista (`ExternalBlacklistSyncService`) pero con un placeholder — el servicio externo real todavía no existe
+- [x] Alimentación masiva de la lista negra (`Api.Web/Services/Blacklist/`: import Excel/.txt vía `POST /api/blacklist/import` verificado con archivo real, reconciliación por placa) — Fase 3. Sincronización con API externa (`HttpExternalBlacklistSource` + `ExternalBlacklistSyncService`, GET + bearer token) verificada end-to-end contra el endpoint real del cliente (ver [ImplementersGuide.md §11](ImplementersGuide.md#11-alimentación-de-la-lista-negra-vehiculosrobados))
 - [x] Consumers de `PlateReadEvent` (RabbitMQ.Client directo), `BlacklistHitPersistenceConsumer` (Dapper, vía CAP), `AlertNotificationConsumer` (vía CAP) — Fase 2
 - [x] `AlertHub` (SignalR) — Fase 2
 - [x] Simulador de carga (`tools/LoadSimulator`, 50 cámaras × 10 lecturas/seg) — Fase 3, construido; validación de latencia bajo carga (<300ms) todavía pendiente de confirmar

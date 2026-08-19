@@ -1,0 +1,3 @@
+Placa;NumeroReporte;FechaReporte;BusquedaActiva;ImagenCarro;Modelo;Año;Vendor;Color;Clase;MarcasUotros
+ABC1234;RPT-2026-001;2026-08-15;Verdadero;;Corolla;2019;Toyota;Gris;Carro;
+XYZ9876;RPT-2026-002;2026-08-16;Verdadero;;Aveo;2020;Chevrolet;Blanco;Carro;Placa delantera doblada

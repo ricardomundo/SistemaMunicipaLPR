@@ -148,10 +148,21 @@ builder.Services.AddCap(x =>
 // usan tanto el import manual de archivos (BlacklistController.Import) como la sincronización
 // periódica con la fuente externa (ExternalBlacklistSyncService).
 builder.Services.AddScoped<IBlacklistImportService, BlacklistImportService>();
-// PlaceholderExternalBlacklistSource: el servicio externo real todavía no existe (no hay
-// endpoint/auth/formato definidos) — reemplazar esta línea por la implementación real en cuanto
-// se tenga el spec, sin tocar ExternalBlacklistSyncService ni el resto del pipeline.
-builder.Services.AddSingleton<IExternalBlacklistSource, PlaceholderExternalBlacklistSource>();
+
+// HttpExternalBlacklistSource: GET simple con bearer token estático (ver
+// ExternalBlacklistApiOptions — BaseUrl en appsettings.json, BearerToken vía user-secrets/env,
+// NUNCA en appsettings.json). AddHttpClient<TInterface, TImplementation> registra un HttpClient
+// tipado, con el auth handler inyectando el header en cada request.
+builder.Services.Configure<ExternalBlacklistApiOptions>(builder.Configuration.GetSection(ExternalBlacklistApiOptions.SectionName));
+builder.Services.AddTransient<ExternalBlacklistAuthHandler>();
+builder.Services.AddHttpClient<IExternalBlacklistSource, HttpExternalBlacklistSource>(client =>
+    {
+        // Timeout corto a propósito: si la red/VPN hacia la API del cliente falla, queremos un
+        // error claro y rápido en el log en vez de esperar el default de HttpClient (~100s) en
+        // silencio antes de que aparezca cualquier mensaje.
+        client.Timeout = TimeSpan.FromSeconds(20);
+    })
+    .AddHttpMessageHandler<ExternalBlacklistAuthHandler>();
 builder.Services.AddHostedService<ExternalBlacklistSyncService>();
 
 var app = builder.Build();
