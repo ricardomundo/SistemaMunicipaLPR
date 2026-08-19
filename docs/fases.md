@@ -99,9 +99,11 @@
 
 **Verificado end-to-end — sincronización con la API externa real:** `HttpExternalBlacklistSource` reemplazó el placeholder — GET simple a `ExternalBlacklist:BaseUrl` con bearer token (`ExternalBlacklist:BearerToken`, configurado vía `dotnet user-secrets`, nunca en `appsettings.json`), contra el endpoint real del cliente (arreglo JSON con `placa`/`numeroReporte`/`fechaReporte`/`busquedaActiva`/`imagenCarro`/`modelo`/`anio`/`vendor`/`color`/`clase`/`marcasUotros`, siempre el catálogo completo). `ExternalBlacklistSyncService` corrió un ciclo real contra ese endpoint y reconcilió los registros correctamente. Reutiliza la misma reconciliación por placa que el import de archivos.
 
+**Verificado end-to-end — latencia bajo carga:** `tools/LoadSimulator` corrió 50 cámaras × 10 lecturas/seg (~500 eventos/seg agregados) durante 60s contra el stack real (Docker Compose + `Api.Web` + `Service.Inference`) — latencia cámara→alerta medida: `n=292 min=11ms avg=33ms p95=83ms max=175ms`. Cumple con margen el presupuesto de <300ms que era el objetivo original de esta mitad de Fase 3. Sin backlog acumulado en RabbitMQ durante la corrida.
+
 **Para retomar:**
-1. Correr `tools/LoadSimulator` para validar por fin la latencia cámara→alerta bajo carga (<300ms) — el objetivo original de esta mitad de Fase 3, todavía sin confirmar.
-2. Diseñar el uploader de imágenes de placa hacia un storage central (hoy solo se guardan en disco local del nodo Edge).
+1. Diseñar el uploader de imágenes de placa hacia un storage central (hoy solo se guardan en disco local del nodo Edge).
+2. Verificación final del pipeline Edge contra una cámara IP física y el nodo Jetson en campo (hoy verificado contra video de prueba y stream RTSP simulado con VLC — ver [vlcTests.md](vlcTests.md)).
 
 ---
 
