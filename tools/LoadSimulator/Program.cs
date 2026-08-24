@@ -9,7 +9,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.EntityFrameworkCore;
-using NetTopologySuite.Geometries;
 using RabbitMQ.Client;
 
 // Simulador de carga de Fase 3: genera tráfico sintético de PlateReadEvent contra el mismo
@@ -52,14 +51,14 @@ using RabbitMQ.Client;
 // consumir, huérfanos en la cola "load-simulator.v1" de RabbitMQ para siempre. Recién después
 // del drain se imprime el resumen final.
 
-const string connectionString = "Server=localhost,1433;Database=SistemaLPR;User Id=sa;Password=Lpr#Dev_2026!;TrustServerCertificate=True";
+const string connectionString = "Server=localhost;Port=3306;Database=SistemaLPR;User=root;Password=Lpr#Dev_2026!;";
 const string hotPlate = "SIMHIT001"; // placa sembrada como VehiculoRobado Activo — genera match a propósito
 
 var mode = args.Length > 0 ? args[0].ToLowerInvariant() : "help";
 var options = ParseOptions(args);
 
 var dbOptions = new DbContextOptionsBuilder<LprDbContext>()
-    .UseSqlServer(connectionString, sql => sql.UseNetTopologySuite())
+    .UseMySql(connectionString, ServerVersion.AutoDetect(connectionString))
     .Options;
 
 switch (mode)
@@ -83,7 +82,6 @@ static string CameraCodigo(int index) => $"CAM-SIM-{index:0000}";
 async Task SeedAsync(int cameraCount)
 {
     using var db = new LprDbContext(dbOptions);
-    var factory = new GeometryFactory(new PrecisionModel(), 4326);
 
     var created = 0;
     for (var i = 1; i <= cameraCount; i++)
@@ -98,7 +96,8 @@ async Task SeedAsync(int cameraCount)
         {
             Codigo = codigo,
             Nombre = $"Cámara simulada #{i} (carga Fase 3)",
-            Ubicacion = factory.CreatePoint(new Coordinate(-100.3161, 25.6866)),
+            Latitude = 25.6866,
+            Longitude = -100.3161,
             TipoInstalacion = TipoInstalacionCamara.ArcoSeguridad,
             VelocidadMaximaKmh = 80,
             Activa = true,
@@ -151,10 +150,10 @@ async Task RunAsync(int cameraCount, double ratePerSecond, int? durationSeconds,
     {
         // CAP aquí ya SOLO sirve para suscribirse a BlacklistHitSavedEvent (bajo volumen, ~1%
         // de las lecturas) — el publish de PlateReadEvent en sí ya no pasa por CAP (ver la nota
-        // grande al inicio del archivo). Sigue usando SQL Server como storage porque
+        // grande al inicio del archivo). Sigue usando una base de datos real como storage porque
         // "UseInMemoryStorage()" no existe en este paquete de CAP 8.x (confirmado 2026-08-18,
         // CS1061 al compilar), pero a este volumen reducido no debería ser un problema.
-        x.UseSqlServer(connectionString);
+        x.UseMySql(connectionString);
 
         x.UseRabbitMQ(o =>
         {

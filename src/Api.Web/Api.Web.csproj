@@ -23,7 +23,7 @@
          en vez de publicar directo al bus — ver ImplementersGuide.md §8. -->
     <PackageReference Include="DotNetCore.CAP" Version="8.*" />
     <PackageReference Include="DotNetCore.CAP.RabbitMQ" Version="8.*" />
-    <PackageReference Include="DotNetCore.CAP.SqlServer" Version="8.*" />
+    <PackageReference Include="DotNetCore.CAP.MySql" Version="8.*" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="9.0.19" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="9.0.3" />
     <PackageReference Include="Microsoft.AspNetCore.SignalR.StackExchangeRedis" Version="9.0.19" />
@@ -31,8 +31,11 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="9.0.19" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer.NetTopologySuite" Version="9.0.19" />
+    <!-- Pomelo (no Microsoft.EntityFrameworkCore.MySql oficial) es el proveedor MySQL de EF Core
+         de facto, activamente mantenido, compatible con EF Core 9. Version sin verificar contra
+         NuGet real (sin acceso a internet desde donde se escribio esto); si "dotnet restore"
+         no la encuentra, ajustar a la ultima 9.0.x publicada. -->
+    <PackageReference Include="Pomelo.EntityFrameworkCore.MySql" Version="9.0.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Tools" Version="9.0.19">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>

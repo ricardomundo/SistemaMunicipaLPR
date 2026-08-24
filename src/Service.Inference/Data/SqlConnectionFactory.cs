@@ -1,7 +1,7 @@
 using System;
 using System.Data;
-using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
+using MySqlConnector;
 
 namespace Service.Inference.Data;
 
@@ -20,5 +20,5 @@ public class SqlConnectionFactory
             ?? throw new InvalidOperationException("Falta la connection string 'SistemaLPR' en la configuración.");
     }
 
-    public IDbConnection Create() => new SqlConnection(_connectionString);
+    public IDbConnection Create() => new MySqlConnection(_connectionString);
 }

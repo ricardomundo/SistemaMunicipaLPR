@@ -1,5 +1,3 @@
-using NetTopologySuite.Geometries;
-
 namespace Core.Domain;
 
 public class Camara
@@ -8,8 +6,9 @@ public class Camara
     public string Codigo { get; set; } = default!;
     public string Nombre { get; set; } = default!;
 
-    /// <summary>SQL Server <c>geography</c> point (SRID 4326 / WGS84) — igual sistema que ESRI/Google Maps.</summary>
-    public Point Ubicacion { get; set; } = default!;
+    /// <summary>Coordenadas WGS84 (mismo sistema que ESRI/Google Maps) de la instalación.</summary>
+    public double Latitude { get; set; }
+    public double Longitude { get; set; }
 
     public TipoInstalacionCamara TipoInstalacion { get; set; }
     public int? VelocidadMaximaKmh { get; set; }

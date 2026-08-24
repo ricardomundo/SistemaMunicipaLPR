@@ -28,7 +28,7 @@ docker compose up -d
 ```
 
 Levanta:
-- **SQL Server 2022** — `localhost:1433` (sa / `Lpr#Dev_2026!`)
+- **MySQL 8.0** — `localhost:3306` (root / `Lpr#Dev_2026!`)
 - **Redis** — `localhost:6379`
 - **RabbitMQ** — `localhost:5672` (AMQP), consola de administración en `localhost:15672` (guest/guest)
 - **Keycloak** — `localhost:8080` (admin / `Lpr#Dev_2026!`), modo `start-dev`
@@ -49,7 +49,7 @@ dotnet build
 
 Keycloak es la única fuente de verdad de **qué rol tiene cada usuario**.
 
-**Autorización (Casbin.NET):** `Api.Web` evalúa qué puede hacer cada rol usando un enforcer de Casbin (`src/Api.Web/Authorization/rbac_model.conf`) con las políticas persistidas en SQL Server (tabla creada automáticamente al arrancar). Casbin es la única fuente de verdad de **qué puede hacer cada rol** — no gestiona usuarios ni roles, solo permisos.
+**Autorización (Casbin.NET):** `Api.Web` evalúa qué puede hacer cada rol usando un enforcer de Casbin (`src/Api.Web/Authorization/rbac_model.conf`) con las políticas persistidas en MySQL (tabla creada automáticamente al arrancar). Casbin es la única fuente de verdad de **qué puede hacer cada rol** — no gestiona usuarios ni roles, solo permisos.
 
 Para proteger un endpoint:
 ```csharp
@@ -59,20 +59,21 @@ public IActionResult Post() => ...
 ```
 Ver [`Controllers/BlacklistController.cs`](src/Api.Web/Controllers/BlacklistController.cs) como referencia completa. La matriz de permisos inicial por rol vive en [`Authorization/CasbinPolicySeeder.cs`](src/Api.Web/Authorization/CasbinPolicySeeder.cs); se re-siembra en cada arranque de forma idempotente (no pisa cambios hechos luego a mano en la tabla de políticas).
 
-> Nota: este sandbox no tiene Docker disponible, así que la integración con Keycloak/SQL Server no se pudo ejecutar de punta a punta aquí — verificar localmente con `docker compose up -d` seguido de `dotnet run --project src/Api.Web`.
+> Nota: este sandbox no tiene Docker disponible, así que la integración con Keycloak/MySQL no se pudo ejecutar de punta a punta aquí — verificar localmente con `docker compose up -d` seguido de `dotnet run --project src/Api.Web`.
 
 ## Modelo de datos (Fase 1)
 
 Entidades en `Core.Domain`, mapeadas por `Api.Web/Data/LprDbContext.cs`, todas en la misma base `SistemaLPR`:
 
-- **Camaras** — incluye `Ubicacion` (`NetTopologySuite.Geometries.Point` mapeado a `geography` de SQL Server, SRID 4326/WGS84 — mismo sistema de coordenadas que ESRI/Google Maps), tipo de instalación (arco de seguridad / avenida de alta velocidad) y velocidad máxima.
+- **Camaras** — incluye `Latitude`/`Longitude` (decimal, WGS84 — mismo sistema de coordenadas que ESRI/Google Maps), tipo de instalación (arco de seguridad / avenida de alta velocidad) y velocidad máxima.
 - **VehiculosRobados** — la Lista Negra auditada; Redis solo cachea `PlateText` para el lookup O(1) del camino caliente, esta tabla es la fuente de verdad.
-- **LecturasHistoricas** — log append-only de cada lectura (match o no), con `EventId` único para deduplicar reintentos del buffer de borde, e índice **columnstore no clusterizado** para las consultas analíticas/forenses sobre volúmenes grandes.
+- **LecturasHistoricas** — log append-only de cada lectura (match o no), con `EventId` único para deduplicar reintentos del buffer de borde, e índice compuesto (`TimestampUtc`, `PlateText`) para las consultas analíticas/forenses sobre volúmenes grandes.
 - **Alertas** — registro auditado de cada coincidencia disparada hacia C4/patrullas.
 
-Migración inicial ya generada (`src/Api.Web/Migrations/`). Para aplicarla contra el SQL Server de `docker compose`:
+Genera la migración inicial y aplícala contra el MySQL de `docker compose`:
 ```bash
 dotnet tool install --global dotnet-ef
+dotnet ef migrations add InitialLprSchema --project src/Api.Web
 dotnet ef database update --project src/Api.Web
 ```
 (`Program.cs` también la aplica automáticamente al arrancar la API vía `Database.Migrate()`.)

@@ -8,21 +8,20 @@ El sistema captura y procesa en tiempo real flujos de video de cámaras instalad
 
 ## 2. Decisión de base de datos: enfoque híbrido políglota
 
-| | SQL Server (principal) | Redis (cache caliente) |
+| | MySQL (principal) | Redis (cache caliente) |
 |---|---|---|
 | **Función** | Lista Negra auditada, logs LPR, usuarios/roles, catálogo de cámaras, reportes forenses | Copia en RAM de las placas activas en la Lista Negra |
 | **Acceso** | Consultas administrativas, forenses, analíticas | Lookup `O(1)` por placa en el camino caliente |
 | **Latencia** | N/A (fuera del camino caliente) | **< 2 ms** |
-| **Por qué** | Transacciones ACID (auditoría de seguridad pública), `Columnstore Index` para forense, integración nativa con EF Core/Dapper | Único mecanismo capaz de sostener el presupuesto de < 300 ms bajo cientos de lecturas/seg |
+| **Por qué** | Transacciones ACID (InnoDB, auditoría de seguridad pública), sin costo de licenciamiento, amplio soporte de hosting/administración, integración con EF Core (Pomelo) y Dapper (MySqlConnector) | Único mecanismo capaz de sostener el presupuesto de < 300 ms bajo cientos de lecturas/seg |
 
-**MySQL descartado:** SQL Server ofrece mejor soporte de concurrencia nativo para .NET y herramientas de auditoría corporativa esperadas por entes gubernamentales.
 **MongoDB descartado:** la relación Auto → Alerta → Cámara → Operador es fija y relacional; un motor NoSQL no aporta flexibilidad aquí y pierde rendimiento frente a un lookup directo en Redis.
 
-**Sincronización SQL Server → Redis:** no es solo el refresco periódico de 5 minutos del blueprint original — un alta de robo urgente no puede esperar ese ciclo. El diseño usa dos mecanismos:
+**Sincronización MySQL → Redis:** no es solo el refresco periódico de 5 minutos del blueprint original — un alta de robo urgente no puede esperar ese ciclo. El diseño usa dos mecanismos:
 1. **Invalidación inmediata event-driven** (`BlacklistEntryAddedEvent` / `BlacklistEntryRemovedEvent`) — se dispara al insertar/remover una fila en `VehiculosRobados`, propagando el cambio a Redis en segundos.
 2. **Refresco delta periódico (5 min)** — como respaldo de reconciliación, no como mecanismo primario.
 
-**Alimentación de `VehiculosRobados`:** los reportes de robo llegan por tres vías que traen los mismos datos — alta/baja manual de un operador, archivos Excel/`.txt`, y (a futuro) una API externa — todas convergiendo en un mismo servicio de reconciliación por placa antes de tocar SQL Server, para que las tres disparen exactamente el mismo mecanismo de invalidación de Redis descrito arriba. Detalle en [ImplementersGuide.md §11](ImplementersGuide.md#11-alimentación-de-la-lista-negra-vehiculosrobados).
+**Alimentación de `VehiculosRobados`:** los reportes de robo llegan por tres vías que traen los mismos datos — alta/baja manual de un operador, archivos Excel/`.txt`, y (a futuro) una API externa — todas convergiendo en un mismo servicio de reconciliación por placa antes de tocar MySQL, para que las tres disparen exactamente el mismo mecanismo de invalidación de Redis descrito arriba. Detalle en [ImplementersGuide.md §11](ImplementersGuide.md#11-alimentación-de-la-lista-negra-vehiculosrobados).
 
 ## 3. Arquitectura de eventos y mensajería
 
@@ -36,14 +35,14 @@ flowchart LR
     CONS -->|"match, vía CAP"| ALERT["BlacklistHitSavedEvent"]
     ALERT -->|CAP| HUB["SignalR Hub\n(AlertHub, en Api.Web)"]
     HUB -->|"push < 100ms"| C4["Dashboard C4 / App patrullas"]
-    ALERT -->|CAP| SQL[("SQL Server\nLecturaHistorica + Alerta")]
+    ALERT -->|CAP| SQL[("MySQL\nLecturaHistorica + Alerta")]
     ADMIN["BlacklistController\n(alta/baja en VehiculosRobados)"] -->|"BlacklistEntryAdded/RemovedEvent, vía CAP"| REDIS
 ```
 
 **Tecnologías:**
 - **RabbitMQ** — amortigua el tráfico de cámaras (publish/subscribe); si la BD se ralentiza, no se pierde un evento.
 - **RabbitMQ.Client directo** para `PlateReadEvent` — el evento de mayor volumen del sistema (cientos por segundo). Se publica y consume por AMQP puro, con ack manual, sin pasar por ningún outbox transaccional: es una señal efímera sin escritura local que necesite atomicidad con el publish, así que no vale la pena pagar el costo de un outbox transaccional a este volumen.
-- **DotNetCore.CAP** para el resto de los eventos (`BlacklistHitSavedEvent`, `BlacklistEntryAddedEvent`/`RemovedEvent`) — volumen bajo, se benefician de outbox transaccional (persistido en SQL Server), reintentos automáticos y agrupación de suscriptores por servicio (`DefaultGroupName`).
+- **DotNetCore.CAP** para el resto de los eventos (`BlacklistHitSavedEvent`, `BlacklistEntryAddedEvent`/`RemovedEvent`) — volumen bajo, se benefician de outbox transaccional (persistido en MySQL), reintentos automáticos y agrupación de suscriptores por servicio (`DefaultGroupName`).
 - **ASP.NET Core SignalR** — WebSocket persistente hacia C4 y la app móvil; push de alerta en < 100 ms, con backplane de Redis para escalar a múltiples instancias de `Api.Web`.
 
 ### Presupuesto de latencia (< 300 ms) y su riesgo principal
@@ -57,7 +56,7 @@ Separación explícita de responsabilidades — cada sistema es la única fuente
 | | Keycloak | Casbin.NET |
 |---|---|---|
 | **Responsabilidad** | Autenticación: quién es el usuario, qué rol tiene | Autorización: qué puede hacer cada rol |
-| **Por qué** | IAM centralizado y auditable con MFA nativo — relevante para un sistema de acceso a datos de seguridad pública; estándar OIDC soporta tanto el dashboard web como la app móvil de patrullas; único punto de identidad si se conecta con otros sistemas municipales (SSO) | Motor de políticas ligero, embebido en `Api.Web`, políticas persistidas en el mismo SQL Server ya usado por el resto del sistema |
+| **Por qué** | IAM centralizado y auditable con MFA nativo — relevante para un sistema de acceso a datos de seguridad pública; estándar OIDC soporta tanto el dashboard web como la app móvil de patrullas; único punto de identidad si se conecta con otros sistemas municipales (SSO) | Motor de políticas ligero, embebido en `Api.Web`, políticas persistidas en el mismo MySQL ya usado por el resto del sistema |
 | **Roles** | Emite `realm_access.roles` en el JWT | Evalúa `(rol, objeto, acción)` contra la tabla de políticas |
 
 Roles: `SuperAdmin`, `SupervisorC4`, `OperadorC4`, `PatrullaMovil`, `AuditorForense`.
@@ -82,7 +81,7 @@ Ver [TechnicalDocumentation.md](TechnicalDocumentation.md#autenticación-y-autor
 - **Backend:** ASP.NET Core Web API + SignalR Hubs + DotNetCore.CAP + RabbitMQ.Client
 - **Edge:** Python (YOLOv8/v11 + OpenCV + PaddleOCR) sobre NVIDIA Jetson Orin Nano o PC industrial
 - **Persistencia:** Dapper (inserciones masivas de alto rendimiento) + EF Core (gestión de usuarios/roles/admin, más compleja)
-- **Bases de datos:** SQL Server 2022 + Redis
+- **Bases de datos:** MySQL 8.0 + Redis
 - **Frontend C4:** React o Angular con WebSockets activos (no seleccionado aún — pendiente)
 
 ## 7. Roadmap
@@ -91,7 +90,7 @@ Ver [TechnicalDocumentation.md](TechnicalDocumentation.md#autenticación-y-autor
 |---|---|---|
 | Fase 0 | Infraestructura base (docker-compose, esqueleto de solución .NET) | ✅ Completa |
 | Pre-Fase 1 | Modelo de Authentication/Authorization (Keycloak + Casbin.NET) | ✅ Completa |
-| Fase 1 | Contratos de eventos + modelo de datos SQL Server | ✅ Completa |
+| Fase 1 | Contratos de eventos + modelo de datos | ✅ Completa |
 | Fase 2 | Cache en Redis (`BlacklistCacheService`), mensajería (CAP + RabbitMQ.Client), `AlertHub` SignalR | ✅ Completa |
 | Fase 3 | Simulador de carga (50 cámaras × 10 lecturas/seg) + módulo Edge Python/YOLO | 🔶 En progreso |
 

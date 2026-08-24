@@ -2,6 +2,8 @@
 
 > Fuente única de verdad del avance por fase. Actualizar este archivo (no crear uno nuevo) cada vez que cambie el estado de una fase. Detalle de diseño en [ArchitectureGuide.md](ArchitectureGuide.md); detalle técnico exacto de lo construido en [TechnicalDocumentation.md](TechnicalDocumentation.md#7-estado-real-de-implementación-checklist-técnico).
 
+> **Pendiente de reconfirmar:** la base de datos relacional del proyecto es MySQL 8 (ver [ArchitectureGuide.md](ArchitectureGuide.md)/[ImplementersGuide.md](ImplementersGuide.md)). Las verificaciones end-to-end de Pre-Fase 1, Fase 1 y Fase 2 registradas abajo se hicieron contra el motor anterior — falta generar la migración inicial de EF Core (`dotnet ef migrations add InitialLprSchema`) y volver a correr esos flujos contra MySQL real antes de dar el cambio de motor por cerrado.
+
 ## Resumen
 
 | Fase | Nombre | Estado |
@@ -21,7 +23,7 @@
 
 **Entregado:**
 - `SistemaLPR.sln` con proyectos `Core.Contracts`, `Core.Domain`, `Service.Inference`, `Api.Web`.
-- `docker-compose.yml`: SQL Server 2022, Redis, RabbitMQ, Keycloak.
+- `docker-compose.yml`: MySQL 8.0, Redis, RabbitMQ, Keycloak.
 
 ---
 
@@ -41,13 +43,12 @@
 
 ## Fase 1 — Contratos de eventos + modelo de datos ✅
 
-**Objetivo:** definir los contratos de eventos y el esquema de SQL Server.
+**Objetivo:** definir los contratos de eventos y el esquema de la base de datos.
 
 **Entregado y verificado end-to-end:**
-- `Core.Domain` (POCOs): `Camara` (con `Ubicacion` geoespacial), `VehiculoRobado`, `LecturaHistorica`, `Alerta`.
+- `Core.Domain` (POCOs): `Camara` (con `Latitude`/`Longitude`), `VehiculoRobado`, `LecturaHistorica`, `Alerta`.
 - `Core.Contracts`: `PlateReadEvent` (sin imagen base64 — ver [ArchitectureGuide.md §3](ArchitectureGuide.md#3-arquitectura-de-eventos-y-mensajería)), `BlacklistHitSavedEvent`, `BlacklistEntryAddedEvent`/`BlacklistEntryRemovedEvent`.
-- `LprDbContext` + migración inicial (`InitialLprSchema`) con índice columnstore en `LecturasHistoricas`.
-- El tipo `geography`/NetTopologySuite serializa y deserializa correctamente end-to-end contra SQL Server real.
+- `LprDbContext` + migración inicial (`InitialLprSchema`) con índice compuesto (`TimestampUtc`, `PlateText`) en `LecturasHistoricas`.
 
 ---
 
@@ -109,7 +110,7 @@
 
 ## Fase 4 — Frontend C4 ⏳
 
-**Objetivo:** dashboard web (React o Angular, aún sin elegir) con mapa de cámaras/alertas (ESRI o Google Maps — la ubicación de cámara ya se modela como `geography` en Fase 1) y consumo del `AlertHub` de SignalR.
+**Objetivo:** dashboard web (React o Angular, aún sin elegir) con mapa de cámaras/alertas (ESRI o Google Maps — la ubicación de cámara ya se modela como `Latitude`/`Longitude` en Fase 1) y consumo del `AlertHub` de SignalR.
 
 **Estado:** no planificada en detalle todavía — depende de que Fase 3 (datos reales fluyendo) esté completa.
 

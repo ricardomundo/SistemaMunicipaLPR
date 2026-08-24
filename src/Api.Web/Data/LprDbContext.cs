@@ -19,7 +19,8 @@ public class LprDbContext(DbContextOptions<LprDbContext> options) : DbContext(op
             entity.Property(c => c.Codigo).HasMaxLength(50).IsRequired();
             entity.HasIndex(c => c.Codigo).IsUnique();
             entity.Property(c => c.Nombre).HasMaxLength(200).IsRequired();
-            entity.Property(c => c.Ubicacion).HasColumnType("geography").IsRequired();
+            entity.Property(c => c.Latitude).HasColumnType("decimal(9,6)").IsRequired();
+            entity.Property(c => c.Longitude).HasColumnType("decimal(9,6)").IsRequired();
             entity.Property(c => c.TipoInstalacion).HasConversion<string>().HasMaxLength(30);
         });
 
@@ -45,7 +46,7 @@ public class LprDbContext(DbContextOptions<LprDbContext> options) : DbContext(op
             entity.HasKey(l => l.Id);
             entity.Property(l => l.PlateText).HasMaxLength(20).IsRequired();
             entity.HasIndex(l => l.EventId).IsUnique();
-            entity.HasIndex(l => l.TimestampUtc);
+            entity.HasIndex(l => new { l.TimestampUtc, l.PlateText });
             entity.HasOne<Camara>().WithMany().HasForeignKey(l => l.CamaraId);
         });
 

@@ -15,7 +15,7 @@ cd C:\Ric68\SistemaMunicipaLPR
 docker compose up -d
 ```
 
-Verifica que los 4 contenedores estén sanos (`docker ps` — SQL Server, Redis, RabbitMQ y Keycloak tienen healthcheck configurado).
+Verifica que los 4 contenedores estén sanos (`docker ps` — MySQL, Redis, RabbitMQ y Keycloak tienen healthcheck configurado).
 
 ## 3. Configurar Keycloak (una sola vez)
 
@@ -57,7 +57,7 @@ Con un token válido de Keycloak (`Authorization: Bearer <token>`) y un usuario 
 1. POCO en `Core.Domain` (sin atributos de EF Core — todo el mapeo va en `LprDbContext.OnModelCreating` vía Fluent API).
 2. Configurar en `Api.Web/Data/LprDbContext.cs`.
 3. `dotnet ef migrations add <Nombre> --project src/Api.Web --context LprDbContext`.
-4. Si la tabla es de alto volumen con fines analíticos/forenses, considerar un índice columnstore (ver el patrón ya usado para `LecturasHistoricas` — se agrega a mano con `migrationBuilder.Sql()` después de generar la migración, EF Core no tiene API fluida para esto).
+4. Si la tabla es de alto volumen con fines analíticos/forenses, considerar un índice compuesto (ver el patrón ya usado para `LecturasHistoricas`: `HasIndex(l => new { l.TimestampUtc, l.PlateText })` en `LprDbContext.OnModelCreating`).
 
 ### Proteger un nuevo endpoint
 ```csharp
@@ -75,7 +75,7 @@ El sistema usa dos caminos de transporte de eventos, según el volumen y las gar
 |---|---|---|
 | **Eventos** | `BlacklistHitSavedEvent`, `BlacklistEntryAddedEvent`, `BlacklistEntryRemovedEvent` | `PlateReadEvent` |
 | **Volumen** | Bajo | Alto (~500/seg agregado) |
-| **Garantías** | Outbox transaccional (`cap.Published`/`cap.Received` en SQL Server), reintentos automáticos, idempotencia | Ninguna más allá de lo que da RabbitMQ (cola durable + ack manual) |
+| **Garantías** | Outbox transaccional (`cap.Published`/`cap.Received` en MySQL), reintentos automáticos, idempotencia | Ninguna más allá de lo que da RabbitMQ (cola durable + ack manual) |
 | **Por qué** | El costo por mensaje del outbox transaccional no es un problema a este volumen, y sí aporta durabilidad/reintentos reales | `PlateReadEvent` es una señal efímera de altísimo volumen, sin escritura local que necesite atomicidad con el publish — el costo del outbox de CAP no se justifica y no lo sostiene a este volumen |
 
 ### Camino CAP (`BlacklistHitSavedEvent` y eventos de blacklist)
@@ -84,9 +84,9 @@ El sistema usa dos caminos de transporte de eventos, según el volumen y las gar
 - **Topics:** CAP enruta por nombre de topic (`string`), no por tipo .NET. Las constantes viven en `Core.Contracts/EventTopics.cs` — usar siempre esas constantes, tanto al publicar como al suscribir.
 - **Publish:** se resuelve `ICapPublisher` (inyectado por DI) y se llama `PublishAsync(topic, evt)`.
 - **`DefaultGroupName` por servicio:** `Service.Inference` y `Api.Web` suscriben ambos a `BlacklistHitSaved` y necesitan cada uno su propia copia del mensaje (uno persiste, el otro empuja por SignalR). Cada servicio configura `x.DefaultGroupName = "..."` en su `AddCap(...)` (`"service-inference"` y `"api-web"` respectivamente) — si dos servicios comparten el mismo `DefaultGroupName` sobre el mismo topic, CAP los trata como competidores por el mismo mensaje, no como suscriptores independientes.
-- **Storage:** `x.UseSqlServer(connectionString)` (tablas `cap.Published`/`cap.Received` en la base `SistemaLPR`) para el outbox, `x.UseRabbitMQ(o => {...})` para el transporte.
+- **Storage:** `x.UseMySql(connectionString)` (tablas `cap.Published`/`cap.Received` en la base `SistemaLPR`) para el outbox, `x.UseRabbitMQ(o => {...})` para el transporte.
 - **Registro en DI:** las clases con `[CapSubscribe]` deben registrarse explícitamente (`AddTransient<TConsumer>()`) para que CAP las descubra al arrancar.
-- **Paquetes:** `DotNetCore.CAP`, `DotNetCore.CAP.RabbitMQ`, `DotNetCore.CAP.SqlServer`, todos `Version="8.*"`.
+- **Paquetes:** `DotNetCore.CAP`, `DotNetCore.CAP.RabbitMQ`, `DotNetCore.CAP.MySql`, todos `Version="8.*"`.
 
 ### Camino directo (`PlateReadEvent`)
 
@@ -113,13 +113,13 @@ El sistema usa dos caminos de transporte de eventos, según el volumen y las gar
     dotnet tool install --global dotnet-ef --version 9.0.19
     ```
 - **Keycloak devuelve `invalid_grant: Account is not fully set up`** en un `password grant`: el usuario tiene una "required action" pendiente (típicamente porque la contraseña quedó marcada `Temporary`). Entra a `http://localhost:8080/realms/sistema-lpr/account/` e inicia sesión con ese usuario — Keycloak muestra en pantalla la acción exacta que falta completar; complétala ahí y reintenta el `password grant`.
-- **`SqlException: Invalid object name 'casbin_rule'`** al arrancar `Api.Web`: `CasbinDbContext<int>.Database.EnsureCreated()` solo crea su propio esquema cuando la base de datos física tiene **cero** tablas. Como `CasbinDbContext<int>` comparte la base `SistemaLPR` con `LprDbContext`, `EnsureCreated()` debe correr **antes** de `LprDbContext.Database.Migrate()` en `Program.cs` (ya está así en el código actual). Si una base ya quedó bootstrapeada en el orden incorrecto, hay que resetear el volumen de SQL Server una vez (no afecta a Redis/RabbitMQ/Keycloak):
+- **`MySqlException: Table 'SistemaLPR.casbin_rule' doesn't exist`** al arrancar `Api.Web`: `CasbinDbContext<int>.Database.EnsureCreated()` solo crea su propio esquema cuando la base de datos física tiene **cero** tablas. Como `CasbinDbContext<int>` comparte la base `SistemaLPR` con `LprDbContext`, `EnsureCreated()` debe correr **antes** de `LprDbContext.Database.Migrate()` en `Program.cs` (ya está así en el código actual). Si una base ya quedó bootstrapeada en el orden incorrecto, hay que resetear el volumen de MySQL una vez (no afecta a Redis/RabbitMQ/Keycloak):
   ```powershell
-  docker compose stop sqlserver
-  docker compose rm -f sqlserver
-  docker volume ls            # busca el volumen *_sqlserver_data
-  docker volume rm <nombre_del_volumen_sqlserver_data>
-  docker compose up -d sqlserver
+  docker compose stop mysql
+  docker compose rm -f mysql
+  docker volume ls            # busca el volumen *_mysql_data
+  docker volume rm <nombre_del_volumen_mysql_data>
+  docker compose up -d mysql
   ```
   Después, `dotnet run --project src/Api.Web` reconstruye todo desde cero en el orden correcto.
 - Varios paquetes NuGet de Microsoft publican versiones que exigen `net10.0`; si `dotnet add package <algo-de-Microsoft>` falla con `NU1202`, buscar la última versión `9.0.x` explícita en vez de dejar que tome la última disponible (ver [TechnicalDocumentation.md §6](TechnicalDocumentation.md#6-paquetes-nuget-relevantes-y-notas-de-versión)).
@@ -166,7 +166,7 @@ dotnet build
 
 **Por qué solo se mide latencia del 1% con match:** con `PlateReadLogging:OnlyLogMatches=true` (default), el resto de las lecturas nunca tocan SQL — para esas, lo relevante es que RabbitMQ no acumule backlog (visible en `http://localhost:15672`), una métrica de throughput distinta que hay que revisar a mano durante el `run`.
 
-**Nota sobre el outbox de CAP bajo carga sintética:** este tool sigue usando CAP (con `UseSqlServer`) para su propio suscriptor de `BlacklistHitSavedEvent` — a la escala de eventos de blacklist (1% del tráfico) esto no genera carga significativa en `cap.Published`/`cap.Received`. Si se aumenta mucho `--match-ratio`, considerar limpiar esas tablas manualmente de vez en cuando (`cleanup` no las toca).
+**Nota sobre el outbox de CAP bajo carga sintética:** este tool sigue usando CAP (con `UseMySql`) para su propio suscriptor de `BlacklistHitSavedEvent` — a la escala de eventos de blacklist (1% del tráfico) esto no genera carga significativa en `cap.Published`/`cap.Received`. Si se aumenta mucho `--match-ratio`, considerar limpiar esas tablas manualmente de vez en cuando (`cleanup` no las toca).
 
 ## 10. Pipeline Edge (Python) — `edge/`
 

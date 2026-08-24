@@ -85,13 +85,13 @@ var sqlConnectionString = builder.Configuration.GetConnectionString("SistemaLPR"
 
 // --- Domain data: Camaras, VehiculosRobados, LecturasHistoricas, Alertas ---
 builder.Services.AddDbContext<LprDbContext>(options =>
-    options.UseSqlServer(sqlConnectionString, sql => sql.UseNetTopologySuite()));
+    options.UseMySql(sqlConnectionString, ServerVersion.AutoDetect(sqlConnectionString)));
 
 // --- Authorization: Casbin decides what each role may do ---
 builder.Services.AddHttpContextAccessor();
 
 builder.Services.AddDbContext<CasbinDbContext<int>>(options =>
-    options.UseSqlServer(sqlConnectionString));
+    options.UseMySql(sqlConnectionString, ServerVersion.AutoDetect(sqlConnectionString)));
 
 builder.Services.AddEFCoreAdapter<int>();
 
@@ -128,7 +128,7 @@ builder.Services.AddCap(x =>
     // CAP usa la misma base "SistemaLPR" para su propio outbox transaccional (tablas
     // cap.Published / cap.Received, creadas automáticamente al arrancar) — no choca con el
     // esquema de LprDbContext ni con casbin_rule.
-    x.UseSqlServer(sqlConnectionString!);
+    x.UseMySql(sqlConnectionString!);
 
     var rabbitMq = builder.Configuration.GetSection("RabbitMq");
     x.UseRabbitMQ(o =>
@@ -176,11 +176,11 @@ var app = builder.Build();
 // with LprDbContext (see appsettings.json), so if LprDbContext's migration ran first and
 // created Camaras/VehiculosRobados/etc., EnsureCreated() sees "this database already has
 // tables" and silently skips creating "casbin_rule" — the app then crashes the moment
-// Casbin tries to load policies (SqlException: Invalid object name 'casbin_rule'). Running
-// EnsureCreated() first, while the database is still empty, avoids that trap. Confirmed
-// during Fase 1 end-to-end verification (2026-08-18) — see ImplementersGuide.md §8. Note:
+// Casbin tries to load policies (MySqlException: Table 'SistemaLPR.casbin_rule' doesn't
+// exist). Running EnsureCreated() first, while the database is still empty, avoids that
+// trap. Confirmed during Fase 1 end-to-end verification — see ImplementersGuide.md §8. Note:
 // on a database that was already bootstrapped in the old order, swapping this order alone
-// will NOT retroactively fix it; the SQL Server volume needs to be reset once.
+// will NOT retroactively fix it; the MySQL volume needs to be reset once.
 using (var scope = app.Services.CreateScope())
 {
     scope.ServiceProvider.GetRequiredService<CasbinDbContext<int>>().Database.EnsureCreated();

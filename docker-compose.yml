@@ -1,17 +1,16 @@
 services:
-  sqlserver:
-    image: mcr.microsoft.com/mssql/server:2022-latest
-    container_name: lpr-sqlserver
+  mysql:
+    image: mysql:8.0
+    container_name: lpr-mysql
     environment:
-      ACCEPT_EULA: "Y"
-      MSSQL_SA_PASSWORD: "Lpr#Dev_2026!"
-      MSSQL_PID: "Developer"
+      MYSQL_ROOT_PASSWORD: "Lpr#Dev_2026!"
+      MYSQL_DATABASE: "SistemaLPR"
     ports:
-      - "1433:1433"
+      - "3306:3306"
     volumes:
-      - sqlserver_data:/var/opt/mssql
+      - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-pLpr#Dev_2026!"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -61,7 +60,7 @@ services:
       - keycloak_data:/opt/keycloak/data
 
 volumes:
-  sqlserver_data:
+  mysql_data:
   redis_data:
   rabbitmq_data:
   keycloak_data:

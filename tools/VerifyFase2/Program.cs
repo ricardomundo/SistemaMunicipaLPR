@@ -3,7 +3,6 @@ using Api.Web.Data;
 using Core.Contracts;
 using Core.Domain;
 using Microsoft.EntityFrameworkCore;
-using NetTopologySuite.Geometries;
 using RabbitMQ.Client;
 
 // Herramienta desechable para probar el camino completo de Fase 2 a mano, ya que todavía no
@@ -18,7 +17,7 @@ using RabbitMQ.Client;
 //   dotnet run -- publish-nomatch  (publica uno que NO debe dar match)
 //   dotnet run -- cleanup          (borra todos los datos de prueba)
 
-const string connectionString = "Server=localhost,1433;Database=SistemaLPR;User Id=sa;Password=Lpr#Dev_2026!;TrustServerCertificate=True";
+const string connectionString = "Server=localhost;Port=3306;Database=SistemaLPR;User=root;Password=Lpr#Dev_2026!;";
 const string testCamaraCodigo = "CAM-TEST-01";
 const string testPlateMatch = "TEST1234";
 const string testPlateNoMatch = "NOMATCH99";
@@ -26,7 +25,7 @@ const string testPlateNoMatch = "NOMATCH99";
 var mode = args.Length > 0 ? args[0].ToLowerInvariant() : "help";
 
 var dbOptions = new DbContextOptionsBuilder<LprDbContext>()
-    .UseSqlServer(connectionString, sql => sql.UseNetTopologySuite())
+    .UseMySql(connectionString, ServerVersion.AutoDetect(connectionString))
     .Options;
 
 switch (mode)
@@ -51,7 +50,6 @@ switch (mode)
 async Task SeedAsync()
 {
     using var db = new LprDbContext(dbOptions);
-    var factory = new GeometryFactory(new PrecisionModel(), 4326);
 
     if (!await db.Camaras.AnyAsync(c => c.Codigo == testCamaraCodigo))
     {
@@ -59,7 +57,8 @@ async Task SeedAsync()
         {
             Codigo = testCamaraCodigo,
             Nombre = "Cámara de prueba (verificación Fase 2)",
-            Ubicacion = factory.CreatePoint(new Coordinate(-100.3161, 25.6866)),
+            Latitude = 25.6866,
+            Longitude = -100.3161,
             TipoInstalacion = TipoInstalacionCamara.ArcoSeguridad,
             VelocidadMaximaKmh = 80,
             Activa = true,

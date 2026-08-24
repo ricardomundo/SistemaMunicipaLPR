@@ -50,7 +50,7 @@ Step "Levantando SQL Server, Redis, RabbitMQ, Keycloak (docker compose up -d)"
 docker compose up -d
 
 Step "Esperando healthchecks..."
-$services = @("lpr-sqlserver", "lpr-redis", "lpr-rabbitmq")
+$services = @("lpr-mysql", "lpr-redis", "lpr-rabbitmq")
 foreach ($svc in $services) {
     $tries = 0
     do {

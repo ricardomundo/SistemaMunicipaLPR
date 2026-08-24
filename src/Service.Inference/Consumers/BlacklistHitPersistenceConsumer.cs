@@ -2,7 +2,7 @@ using System.Threading.Tasks;
 using Core.Contracts;
 using Dapper;
 using DotNetCore.CAP;
-using Microsoft.Data.SqlClient;
+using MySqlConnector;
 using Microsoft.Extensions.Logging;
 using Service.Inference.Data;
 
@@ -44,7 +44,7 @@ public class BlacklistHitPersistenceConsumer : ICapSubscribe
         }
 
         var vehiculoRobadoId = await connection.QuerySingleOrDefaultAsync<int?>(
-            "SELECT TOP 1 Id FROM VehiculosRobados WHERE PlateText = @PlateText AND Estado = 'Activo'",
+            "SELECT Id FROM VehiculosRobados WHERE PlateText = @PlateText AND Estado = 'Activo' LIMIT 1",
             new { reading.PlateText });
         if (vehiculoRobadoId is null)
         {
@@ -61,7 +61,7 @@ public class BlacklistHitPersistenceConsumer : ICapSubscribe
             lecturaHistoricaId = await connection.ExecuteScalarAsync<long>(
                 @"INSERT INTO LecturasHistoricas (EventId, PlateText, CamaraId, TimestampUtc, Confidence, ImageReference, EsCoincidenciaBlacklist)
                   VALUES (@EventId, @PlateText, @CamaraId, @TimestampUtc, @Confidence, @ImageReference, 1);
-                  SELECT CAST(SCOPE_IDENTITY() AS bigint);",
+                  SELECT LAST_INSERT_ID();",
                 new
                 {
                     reading.EventId,
@@ -72,9 +72,10 @@ public class BlacklistHitPersistenceConsumer : ICapSubscribe
                     reading.ImageReference
                 });
         }
-        catch (SqlException ex) when (ex.Number is 2601 or 2627)
+        catch (MySqlException ex) when (ex.Number == 1062)
         {
-            // Ya se había procesado este EventId antes (redelivery) — evita duplicar la Alerta.
+            // Ya se había procesado este EventId antes (redelivery, código 1062 = duplicate
+            // entry) — evita duplicar la Alerta.
             _logger.LogInformation("BlacklistHitSavedEvent {EventId} ya estaba registrado (dedupe por EventId).", reading.EventId);
             return;
         }

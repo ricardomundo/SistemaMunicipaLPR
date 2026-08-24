@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 using Core.Contracts;
 using Dapper;
 using DotNetCore.CAP;
-using Microsoft.Data.SqlClient;
+using MySqlConnector;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -178,10 +178,11 @@ public class PlateReadConsumer : BackgroundService
                     reading.ImageReference
                 });
         }
-        catch (SqlException ex) when (ex.Number is 2601 or 2627)
+        catch (MySqlException ex) when (ex.Number == 1062)
         {
             // Ya se había insertado esta lectura antes (reintento/redelivery) — el índice
-            // único de EventId lo bloqueó, tal como se espera. No es un error real.
+            // único de EventId lo bloqueó (código 1062 = duplicate entry), tal como se espera.
+            // No es un error real.
             _logger.LogInformation("PlateReadEvent {EventId} ya estaba registrado (dedupe por EventId).", reading.EventId);
         }
     }

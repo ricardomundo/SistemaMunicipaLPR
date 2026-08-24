@@ -27,7 +27,7 @@ builder.Services.AddHostedService<PlateReadConsumer>();
 builder.Services.AddCap(x =>
 {
     var sqlConnectionString = builder.Configuration.GetConnectionString("SistemaLPR");
-    x.UseSqlServer(sqlConnectionString!);
+    x.UseMySql(sqlConnectionString!);
 
     var rabbitMq = builder.Configuration.GetSection("RabbitMq");
     x.UseRabbitMQ(o =>
