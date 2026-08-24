@@ -13,6 +13,7 @@
 | Fase 1 | Contratos de eventos + modelo de datos | ✅ Completa (verificada end-to-end) |
 | Fase 2 | Cache Redis + mensajería (DotNetCore.CAP + RabbitMQ.Client) + SignalR | ✅ Completa (verificada end-to-end) |
 | Fase 3 | Simulador de carga + módulo Edge (Python/YOLO) | 🔶 En progreso |
+| Fase 3.5 | Integración con RedLists (lista roja de vehículos, reemplaza la blacklist propia) | ⏳ Diseño confirmado, implementación pendiente |
 | Fase 4 | Frontend C4 (dashboard web + mapa) | ⏳ Pendiente |
 
 ---
@@ -105,6 +106,25 @@
 **Para retomar:**
 1. Diseñar el uploader de imágenes de placa hacia un storage central (hoy solo se guardan en disco local del nodo Edge).
 2. Verificación final del pipeline Edge contra una cámara IP física y el nodo Jetson en campo (hoy verificado contra video de prueba y stream RTSP simulado con VLC — ver [vlcTests.md](vlcTests.md)).
+
+---
+
+## Fase 3.5 — Integración con RedLists (lista roja de vehículos) ⏳
+
+**Objetivo:** [RedLists](../../RedLists) (`C:\Ric68\RedLists`, repo separado) es el sistema dedicado a gestionar listas de vehículos (RedList = vehículos robados/reportados, WhiteList) — construido con `VehicleListsService` (API REST + hub de SignalR, dueño de `vehicle_lists`/`vehicles`/`list_vehicles`) y `ExternalVehicleFeedService` (sincronización desde fuentes externas vía patrón de adaptador). Reemplaza por completo el subsistema de blacklist construido dentro de este repo — ambos hacían el mismo trabajo por separado. RedLists pasa a ser la única fuente de verdad de vehículos reportados; comparte la misma base de datos MySQL y el mismo servidor/infraestructura Docker que este proyecto.
+
+**Decisión confirmada (no solo compartir infraestructura, sino reemplazo real):**
+1. **Base de datos consolidada:** las tablas de RedLists (`vehicle_lists`, `vehicles`, `list_vehicles`, `adapters`, `sync_runs`, `imported_vehicles_log`) se mueven a la misma base `SistemaLPR` (mismo servidor MySQL, mismo `docker-compose.yml`) — sin colisión de nombres con el esquema existente (RedLists usa `snake_case`, este repo usa `PascalCase` vía EF Core). `VehicleListsService`/`ExternalVehicleFeedService` actualizan su `ConnectionString` para apuntar ahí.
+2. **Se retira el subsistema de blacklist propio:** `VehiculosRobados` (tabla + entidad `Core.Domain`), `BlacklistController`, `BlacklistImportService`, `HttpExternalBlacklistSource`/`ExternalBlacklistSyncService`/`ExternalBlacklistApiOptions`/`ExternalBlacklistAuthHandler` — toda esa responsabilidad la asume RedLists.
+3. **`Service.Inference` se reconecta a RedLists:** `BlacklistCacheService` deja de leer `VehiculosRobados` y consulta directo las tablas de RedLists con una agregación por placa (RedLists no deduplica — una placa puede tener varias filas en `vehicles`/`list_vehicles` — así que el `SELECT` hacia Redis usa `DISTINCT` y filtra `recovered_by_org_id = 0`, en vez de pedirle esa garantía al esquema). Invalidación event-driven: en vez de los eventos CAP propios (`BlacklistEntryAddedEvent`/`RemovedEvent`), `Service.Inference` se suscribe como cliente al hub de SignalR de RedLists (`VehicleAdded`/`VehicleRemoved`/`VehicleRecovered` en `/hubs/vehicle-lists`).
+4. **Terminología:** "blacklist"/"lista negra" se reemplaza por "RedList"/"lista roja" en documentación y nombres nuevos de este repo — nota: el propio código de RedLists nunca usa la palabra "blacklist" (nunca existió ahí) y tampoco usa "RedList" en su enum de dominio (`VehicleListType.Vehicles` es el valor que representa la RedList) — es un nombre de producto/UI, no un identificador técnico.
+
+**Pendiente:**
+1. Migrar el esquema de RedLists a la base `SistemaLPR` y repuntar `VehicleListsService`/`ExternalVehicleFeedService`.
+2. Eliminar el subsistema de blacklist propio (código + migración) una vez migrados los datos existentes que haga falta conservar.
+3. Reescribir `BlacklistCacheService`/`Service.Inference` contra el esquema de RedLists (consulta agregada + suscripción a SignalR en vez de CAP).
+4. Decidir si `Api.Web` necesita llamar a `VehicleListsService` por HTTP en algún flujo (hoy ninguno de los 4 componentes de RedLists tiene autenticación implementada — relevante si se expone algo más allá del acceso directo a MySQL desde `Service.Inference`).
+5. Actualizar `ArchitectureGuide.md`/`TechnicalDocumentation.md`/`ImplementersGuide.md` para reflejar RedLists como arquitectura vigente, sin referencias a `VehiculosRobados`/`BlacklistController`.
 
 ---
 
