@@ -46,7 +46,7 @@ if (-not $SkipEdgeVenv -and -not (Get-Command python -ErrorAction SilentlyContin
 }
 
 # --- 1. Infraestructura (docker compose) ---
-Step "Levantando SQL Server, Redis, RabbitMQ, Keycloak (docker compose up -d)"
+Step "Levantando MySQL, Redis, RabbitMQ, Keycloak (docker compose up -d)"
 docker compose up -d
 
 Step "Esperando healthchecks..."
@@ -73,11 +73,20 @@ Ok "build correcto"
 # Program.cs ya aplica EnsureCreated()/Migrate() automáticamente al arrancar Api.Web (ver el
 # comentario sobre el orden Casbin -> LprDbContext en Program.cs), pero lo hacemos explícito
 # aquí para no depender de arrancar la API a mano la primera vez.
+#
+# --context LprDbContext es obligatorio: Api.Web tiene DOS DbContext (LprDbContext y el
+# CasbinDbContext<int> que usa Casbin.NET.Adapter.EFCore) -- sin especificar cuál, "dotnet ef"
+# falla con "More than one DbContext was found". CasbinDbContext<int> no usa migraciones (usa
+# EnsureCreated(), ver Program.cs), así que nunca hace falta generarle una migración a ese.
 Step "Aplicando migraciones de base de datos"
 if (-not (dotnet tool list --global | Select-String "dotnet-ef")) {
     dotnet tool install --global dotnet-ef
 }
-dotnet ef database update --project src/Api.Web
+if (-not (Test-Path src\Api.Web\Migrations)) {
+    Ok "no hay ninguna migración todavía -- generando InitialLprSchema"
+    dotnet ef migrations add InitialLprSchema --project src/Api.Web --context LprDbContext
+}
+dotnet ef database update --project src/Api.Web --context LprDbContext
 Ok "migraciones aplicadas"
 
 # --- 4. user-secrets (NUNCA van en appsettings.json ni en git) ---
