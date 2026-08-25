@@ -4,7 +4,6 @@ using Api.Web.Authorization;
 using Api.Web.Consumers;
 using Api.Web.Data;
 using Api.Web.Hubs;
-using Api.Web.Services.Blacklist;
 using Casbin;
 using Casbin.Persist;
 using Casbin.Persist.Adapter.EFCore;
@@ -83,7 +82,9 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 var sqlConnectionString = builder.Configuration.GetConnectionString("SistemaLPR");
 
-// --- Domain data: Camaras, VehiculosRobados, LecturasHistoricas, Alertas ---
+// --- Domain data: Camaras, LecturasHistoricas, Alertas (la lista de vehículos
+// reportados vive en RedLists -- VehicleListsService -- sobre la misma base SistemaLPR,
+// ver Fase 3.5 en docs/fases.md) ---
 builder.Services.AddDbContext<LprDbContext>(options =>
     options.UseMySql(sqlConnectionString, ServerVersion.AutoDetect(sqlConnectionString)));
 
@@ -142,28 +143,11 @@ builder.Services.AddCap(x =>
     x.DefaultGroupName = "api-web";
 });
 
-// --- Fase 3: alimentación de la lista negra (VehiculosRobados) desde múltiples fuentes que
-// traen los mismos datos (API externa, Excel, .txt) — ver ImplementersGuide.md §11.
-// IBlacklistImportService concentra la reconciliación por placa (alta/baja/actualización) que
-// usan tanto el import manual de archivos (BlacklistController.Import) como la sincronización
-// periódica con la fuente externa (ExternalBlacklistSyncService).
-builder.Services.AddScoped<IBlacklistImportService, BlacklistImportService>();
-
-// HttpExternalBlacklistSource: GET simple con bearer token estático (ver
-// ExternalBlacklistApiOptions — BaseUrl en appsettings.json, BearerToken vía user-secrets/env,
-// NUNCA en appsettings.json). AddHttpClient<TInterface, TImplementation> registra un HttpClient
-// tipado, con el auth handler inyectando el header en cada request.
-builder.Services.Configure<ExternalBlacklistApiOptions>(builder.Configuration.GetSection(ExternalBlacklistApiOptions.SectionName));
-builder.Services.AddTransient<ExternalBlacklistAuthHandler>();
-builder.Services.AddHttpClient<IExternalBlacklistSource, HttpExternalBlacklistSource>(client =>
-    {
-        // Timeout corto a propósito: si la red/VPN hacia la API del cliente falla, queremos un
-        // error claro y rápido en el log en vez de esperar el default de HttpClient (~100s) en
-        // silencio antes de que aparezca cualquier mensaje.
-        client.Timeout = TimeSpan.FromSeconds(20);
-    })
-    .AddHttpMessageHandler<ExternalBlacklistAuthHandler>();
-builder.Services.AddHostedService<ExternalBlacklistSyncService>();
+// --- Fase 3.5: la lista de vehículos reportados (antes "blacklist" propia, alimentada por
+// IBlacklistImportService/ExternalBlacklistSyncService) la administra ahora RedLists
+// (VehicleListsService/ExternalVehicleFeedService, repo separado) -- ver docs/fases.md. Api.Web
+// no tiene aquí ningún registro correspondiente; Service.Inference lee el esquema de RedLists
+// directo (ver Service.Inference/RedListCacheService.cs).
 
 var app = builder.Build();
 
@@ -183,6 +167,18 @@ var app = builder.Build();
 // will NOT retroactively fix it; the MySQL volume needs to be reset once.
 using (var scope = app.Services.CreateScope())
 {
+    // TEMPORAL -- herramienta de diagnóstico, no forma parte del arranque normal. Imprime el
+    // script SQL exacto que EF Core generaría para crear "casbin_rule" a partir del modelo real
+    // (sin adivinar columnas/tipos a mano) y termina, sin tocar la base. Se puede borrar este
+    // bloque una vez aplicado el script a mano. Uso:
+    //   dotnet run --project src\Api.Web -- --print-casbin-schema
+    if (args.Contains("--print-casbin-schema"))
+    {
+        var script = scope.ServiceProvider.GetRequiredService<CasbinDbContext<int>>().Database.GenerateCreateScript();
+        Console.WriteLine(script);
+        return;
+    }
+
     scope.ServiceProvider.GetRequiredService<CasbinDbContext<int>>().Database.EnsureCreated();
     scope.ServiceProvider.GetRequiredService<LprDbContext>().Database.Migrate();
 

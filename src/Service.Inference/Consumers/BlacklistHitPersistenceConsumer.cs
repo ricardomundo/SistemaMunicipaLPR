@@ -9,12 +9,12 @@ using Service.Inference.Data;
 namespace Service.Inference.Consumers;
 
 /// <summary>
-/// Persiste el rastro de auditoría (LecturaHistorica + Alerta) de cada match de blacklist.
-/// Corre como suscriptor separado de PlateReadConsumer para no meter esta escritura síncrona
-/// en el camino caliente de matching — a esta altura ya se publicó BlacklistHitSavedEvent, y
+/// Persiste el rastro de auditoría (LecturaHistorica + Alerta) de cada match contra RedLists.
+/// Corre como suscriptor separado de PlateReadConsumer para no meter esta escritura síncrona en
+/// el camino caliente de matching -- a esta altura ya se publicó BlacklistHitSavedEvent, y
 /// AlertNotificationConsumer (en Api.Web) ya puede empujar la alerta por SignalR en paralelo,
-/// sin esperar a que esta escritura a SQL termine (cada servicio tiene su propio "Group" de
-/// CAP sobre el mismo topic, así que ambos reciben su propia copia del mensaje).
+/// sin esperar a que esta escritura a SQL termine (cada servicio tiene su propio "Group" de CAP
+/// sobre el mismo topic, así que ambos reciben su propia copia del mensaje).
 /// </summary>
 public class BlacklistHitPersistenceConsumer : ICapSubscribe
 {
@@ -43,14 +43,25 @@ public class BlacklistHitPersistenceConsumer : ICapSubscribe
             return;
         }
 
-        var vehiculoRobadoId = await connection.QuerySingleOrDefaultAsync<int?>(
-            "SELECT Id FROM VehiculosRobados WHERE PlateText = @PlateText AND Estado = 'Activo' LIMIT 1",
+        // RedLists no deduplica por placa (una placa puede tener varias filas en vehicles/
+        // list_vehicles) -- toma la membresía activa más reciente en una lista tipo 'Vehicles'
+        // (RedList) para esta placa. Ver Fase 3.5 en docs/fases.md.
+        var redListVehicleId = await connection.QuerySingleOrDefaultAsync<long?>(
+            @"SELECT v.id
+              FROM vehicles v
+              JOIN list_vehicles lv ON lv.vehicle_id = v.id
+              JOIN vehicle_lists vl ON vl.id = lv.list_id
+              WHERE v.plate_number = @PlateText
+                AND lv.recovered_by_org_id = 0
+                AND vl.list_type = 'Vehicles'
+              ORDER BY lv.added_at DESC
+              LIMIT 1",
             new { reading.PlateText });
-        if (vehiculoRobadoId is null)
+        if (redListVehicleId is null)
         {
             _logger.LogWarning(
-                "BlacklistHitSavedEvent para placa '{PlateText}' no encontró un VehiculoRobado Activo correspondiente " +
-                "(¿se dio de baja entre el lookup en Redis y este consumer?) — no se registra la Alerta.",
+                "BlacklistHitSavedEvent para placa '{PlateText}' no encontró una membresía activa en RedLists " +
+                "(¿se dio de baja/recuperó entre el lookup en Redis y este consumer?) — no se registra la Alerta.",
                 reading.PlateText);
             return;
         }
@@ -81,17 +92,17 @@ public class BlacklistHitPersistenceConsumer : ICapSubscribe
         }
 
         await connection.ExecuteAsync(
-            @"INSERT INTO Alertas (LecturaHistoricaId, VehiculoRobadoId, TimestampUtc, Estado)
-              VALUES (@LecturaHistoricaId, @VehiculoRobadoId, @TimestampUtc, 'Pendiente');",
+            @"INSERT INTO Alertas (LecturaHistoricaId, RedListVehicleId, TimestampUtc, Estado)
+              VALUES (@LecturaHistoricaId, @RedListVehicleId, @TimestampUtc, 'Pendiente');",
             new
             {
                 LecturaHistoricaId = lecturaHistoricaId,
-                VehiculoRobadoId = vehiculoRobadoId.Value,
+                RedListVehicleId = redListVehicleId.Value,
                 TimestampUtc = message.MatchedAtUtc
             });
 
         _logger.LogInformation(
-            "Alerta registrada: LecturaHistoricaId={LecturaHistoricaId}, VehiculoRobadoId={VehiculoRobadoId}, Placa={PlateText}.",
-            lecturaHistoricaId, vehiculoRobadoId, reading.PlateText);
+            "Alerta registrada: LecturaHistoricaId={LecturaHistoricaId}, RedListVehicleId={RedListVehicleId}, Placa={PlateText}.",
+            lecturaHistoricaId, redListVehicleId, reading.PlateText);
     }
 }

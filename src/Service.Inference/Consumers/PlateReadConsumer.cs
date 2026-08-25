@@ -25,7 +25,7 @@ namespace Service.Inference.Consumers;
 /// razonamiento en ArchitectureGuide.md §3 e ImplementersGuide.md §7.
 ///
 /// Por cada PlateReadEvent hace un solo lookup O(1) contra el set de Redis
-/// "blacklist:active-plates". Si hay match, publica BlacklistHitSavedEvent — ESE publish SÍ se
+/// "redlist:active-plates". Si hay match, publica BlacklistHitSavedEvent — ESE publish SÍ se
 /// queda en CAP (ver <see cref="EventTopics.BlacklistHitSaved"/>): es de bajo volumen y se
 /// beneficia del outbox transaccional/reintentos/grupos de CAP. El push a SignalR (en Api.Web)
 /// y la persistencia de LecturaHistorica/Alerta (BlacklistHitPersistenceConsumer, en este mismo
@@ -126,7 +126,7 @@ public class PlateReadConsumer : BackgroundService
     private async Task HandleAsync(PlateReadEvent reading)
     {
         var db = _redis.GetDatabase();
-        var isMatch = await db.SetContainsAsync(BlacklistRedisKeys.ActivePlates, reading.PlateText);
+        var isMatch = await db.SetContainsAsync(RedListRedisKeys.ActivePlates, reading.PlateText);
 
         if (isMatch)
         {

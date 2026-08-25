@@ -18,10 +18,12 @@ namespace Core.Contracts;
 /// el publish del evento resultante no se pierda si el proceso truena a medio camino — ahí sí
 /// vale la pena pagar el costo del outbox).
 ///
-/// El resto de los eventos (BlacklistHitSavedEvent, BlacklistEntryAddedEvent/RemovedEvent —
-/// ver <see cref="EventTopics"/>) son de bajo volumen y SÍ se quedan en CAP: se benefician del
-/// outbox transaccional, reintentos automáticos, y la convención de "Group" por servicio, sin
-/// que su costo por mensaje sea un problema a ese volumen.
+/// El resto de los eventos (BlacklistHitSavedEvent — ver <see cref="EventTopics"/>) son de
+/// bajo volumen y SÍ se quedan en CAP: se benefician del outbox transaccional, reintentos
+/// automáticos, y la convención de "Group" por servicio, sin que su costo por mensaje sea un
+/// problema a ese volumen. (BlacklistEntryAddedEvent/RemovedEvent, que también vivían aquí,
+/// se retiraron en Fase 3.5 -- ver docs/fases.md -- Service.Inference se suscribe ahora
+/// directo al hub de SignalR de RedLists en vez de a un evento propio de este repo.)
 ///
 /// Detalle completo del hallazgo y el diseño en ImplementersGuide.md §9.
 /// </summary>

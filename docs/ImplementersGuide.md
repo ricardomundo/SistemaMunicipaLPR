@@ -36,6 +36,8 @@ dotnet ef database update --project src/Api.Web --context LprDbContext
 
 `Program.cs` también aplica las migraciones automáticamente al arrancar (este paso manual es solo para adelantarlo o depurar). La tabla de políticas de Casbin (`casbin_rule`) se crea sola (`EnsureCreated()`, antes de que corran las migraciones de `LprDbContext` — ambos contextos comparten la base `SistemaLPR`) y se siembra con la matriz de permisos por defecto en cada arranque.
 
+**Nota sobre Fase 3.5:** el esquema de `LprDbContext` cambió al retirar el subsistema de blacklist propio (se eliminó `VehiculosRobados`, `Alertas.VehiculoRobadoId` pasó a `Alertas.RedListVehicleId`, ver §11) y la migración `InitialLprSchema` original se regeneró desde cero — este repo no trae ninguna migración pre-generada. `tools/setup-new-machine.ps1` la genera sola si no encuentra ninguna en `src/Api.Web/Migrations`. Si tu máquina ya tenía una base `SistemaLPR` de antes de este cambio, hay que reiniciar el volumen de MySQL una vez antes de que la migración regenerada aplique limpio — mismo procedimiento que la sección "`MySqlException: Table 'SistemaLPR.casbin_rule' doesn't exist`" en §8.
+
 ## 5. Correr la API
 
 ```bash
@@ -43,8 +45,9 @@ dotnet run --project src/Api.Web
 dotnet run --project src/Service.Inference
 ```
 
-Prueba rápida sin token (debe dar 401): `GET https://localhost:{puerto}/api/blacklist`.
-Con un token válido de Keycloak (`Authorization: Bearer <token>`) y un usuario con rol `OperadorC4` o superior, debe dar 200.
+Ambos deben arrancar sin errores contra la infraestructura del paso 2 (MySQL, Redis, RabbitMQ). `Api.Web` además crea `casbin_rule` y aplica las migraciones de `LprDbContext` al arrancar (ver §4). `Service.Inference` intenta conectarse al hub de SignalR de RedLists (`RedListCacheService`, ver §7) — si RedLists no está corriendo todavía el intento falla con un log de error, pero **no es fatal**: la caché sigue refrescándose completa cada 5 minutos como respaldo hasta que RedLists esté disponible.
+
+**Nota:** hoy no hay ningún endpoint REST de negocio protegido por Casbin en `Api.Web` — Fase 4 (Frontend C4) todavía no empezó, y el único controller que existía (`BlacklistController`) se retiró en Fase 3.5 (ver §11). El único controller presente es `WeatherForecastController`, la plantilla default de ASP.NET Core, sin `[CasbinResource]`. Para probar el flujo Keycloak→Casbin en aislado antes de que exista un endpoint real de negocio, agrega temporalmente `[Authorize(Policy = "Casbin")]` + `[CasbinResource("<objeto>", "<accion>")]` a ese controller (ver §6, "Proteger un nuevo endpoint") y usa una de las filas ya sembradas en `CasbinPolicySeeder.DefaultPolicies` (p. ej. `("OperadorC4", "camaras", "read")`) para decidir qué objeto/acción probar. Para verificar el pipeline completo de matching de punta a punta — que sí funciona hoy end-to-end, sin pasar por REST — usa `tools/VerifyFase2` (§9).
 
 ## 6. Cómo extender el sistema
 
@@ -67,18 +70,18 @@ public IActionResult MiAccion() => ...
 ```
 Si el objeto/acción es nuevo, agregar las filas correspondientes por rol en `CasbinPolicySeeder.DefaultPolicies` (el seeder es idempotente, seguro de re-ejecutar).
 
-## 7. Arquitectura de mensajería: DotNetCore.CAP + RabbitMQ.Client
+## 7. Arquitectura de mensajería: DotNetCore.CAP + RabbitMQ.Client + SignalR (cliente)
 
-El sistema usa dos caminos de transporte de eventos, según el volumen y las garantías que necesita cada uno:
+El sistema usa tres caminos distintos de integración por evento/dato, según el volumen y las garantías que necesita cada uno:
 
-| | DotNetCore.CAP | RabbitMQ.Client directo |
-|---|---|---|
-| **Eventos** | `BlacklistHitSavedEvent`, `BlacklistEntryAddedEvent`, `BlacklistEntryRemovedEvent` | `PlateReadEvent` |
-| **Volumen** | Bajo | Alto (~500/seg agregado) |
-| **Garantías** | Outbox transaccional (`cap.Published`/`cap.Received` en MySQL), reintentos automáticos, idempotencia | Ninguna más allá de lo que da RabbitMQ (cola durable + ack manual) |
-| **Por qué** | El costo por mensaje del outbox transaccional no es un problema a este volumen, y sí aporta durabilidad/reintentos reales | `PlateReadEvent` es una señal efímera de altísimo volumen, sin escritura local que necesite atomicidad con el publish — el costo del outbox de CAP no se justifica y no lo sostiene a este volumen |
+| | DotNetCore.CAP | RabbitMQ.Client directo | SignalR (cliente, hacia RedLists) |
+|---|---|---|---|
+| **Uso** | `BlacklistHitSavedEvent` | `PlateReadEvent` | Invalidación de `redlist:active-plates` en Redis |
+| **Volumen** | Bajo | Alto (~500/seg agregado) | Bajo (solo altas/bajas/recuperaciones en RedLists) |
+| **Garantías** | Outbox transaccional (`cap.Published`/`cap.Received` en MySQL), reintentos automáticos, idempotencia | Ninguna más allá de lo que da RabbitMQ (cola durable + ack manual) | Ninguna por sí sola — por eso se combina con un refresco delta completo cada 5 min (ver abajo) |
+| **Por qué** | El costo por mensaje del outbox transaccional no es un problema a este volumen, y sí aporta durabilidad/reintentos reales | `PlateReadEvent` es una señal efímera de altísimo volumen, sin escritura local que necesite atomicidad con el publish — el costo del outbox de CAP no se justifica y no lo sostiene a este volumen | RedLists es un repo/deploy separado (no un topic propio de este sistema) — este servicio se conecta como cliente a SU hub, no publica ni suscribe nada por CAP/RabbitMQ para esto |
 
-### Camino CAP (`BlacklistHitSavedEvent` y eventos de blacklist)
+### Camino CAP (`BlacklistHitSavedEvent`)
 
 - **Modelo de suscripción:** cada consumer implementa el marcador `ICapSubscribe` y expone un método público (por convención, `HandleAsync`) decorado con `[CapSubscribe("<topic>")]`, recibiendo el mensaje deserializado directo como parámetro.
 - **Topics:** CAP enruta por nombre de topic (`string`), no por tipo .NET. Las constantes viven en `Core.Contracts/EventTopics.cs` — usar siempre esas constantes, tanto al publicar como al suscribir.
@@ -88,15 +91,28 @@ El sistema usa dos caminos de transporte de eventos, según el volumen y las gar
 - **Registro en DI:** las clases con `[CapSubscribe]` deben registrarse explícitamente (`AddTransient<TConsumer>()`) para que CAP las descubra al arrancar.
 - **Paquetes:** `DotNetCore.CAP`, `DotNetCore.CAP.RabbitMQ`, `DotNetCore.CAP.MySql`, todos `Version="8.*"`.
 
+**Nota histórica:** hasta Fase 3.5 este mismo camino CAP también transportaba `BlacklistEntryAddedEvent`/`BlacklistEntryRemovedEvent`, publicados por el `BlacklistController` propio de este repo cada vez que alguien daba de alta/baja un vehículo. Ese subsistema se retiró por completo (ver §11) — RedLists reemplaza esa función y este repo ya no publica ni suscribe esos dos eventos.
+
 ### Camino directo (`PlateReadEvent`)
 
 - `PlateReadEvent` se publica y consume con `RabbitMQ.Client` puro, sin pasar por CAP — cola durable `plate-read-event.raw` (constante en `Core.Contracts/RawQueues.cs`).
 - **`RabbitMQ.Client` resuelve en su serie 7.x** (no tiene `PackageReference` explícita — llega transitivamente vía `DotNetCore.CAP.RabbitMQ`), cuya API es async-only: `IChannel` en vez de `IModel`, y los métodos de publish/consumo/ack tienen sufijo `Async` (`CreateConnectionAsync`, `CreateChannelAsync`, `QueueDeclareAsync`, `BasicPublishAsync`, `BasicConsumeAsync`, `BasicAckAsync`/`BasicNackAsync`, `BasicQosAsync`). `BasicProperties` se instancia directo (`new BasicProperties()`, ya no `channel.CreateBasicProperties()`), y el mensaje persistente se marca con `DeliveryMode = DeliveryModes.Persistent`.
 - **Publish:** abrir una `IConnection`/`IChannel`, declarar la cola (`durable: true`), serializar el evento a JSON (`System.Text.Json`) y `BasicPublishAsync`. Ver `tools/VerifyFase2/Program.cs` y `tools/LoadSimulator/Program.cs` como referencia.
-- **Consumo:** `Service.Inference/Consumers/PlateReadConsumer.cs` es un `BackgroundService` normal (no un `[CapSubscribe]`) que abre su propio canal, configura `BasicQosAsync(prefetchCount: 100)` (necesario para throughput — sin esto RabbitMQ entrega un mensaje a la vez y espera el ack), y consume con `AsyncEventingBasicConsumer` (evento `ReceivedAsync`): deserializa el body, ejecuta el lookup de blacklist en Redis, y hace `BasicAckAsync`/`BasicNackAsync(requeue: true)` según el resultado. Si hay match, publica `BlacklistHitSavedEvent` — ese publish sí va por CAP (camino de bajo volumen). El cierre de `IChannel`/`IConnection` (ambos `IAsyncDisposable`) se hace en `StopAsync`, no en `Dispose()`.
+- **Consumo:** `Service.Inference/Consumers/PlateReadConsumer.cs` es un `BackgroundService` normal (no un `[CapSubscribe]`) que abre su propio canal, configura `BasicQosAsync(prefetchCount: 100)` (necesario para throughput — sin esto RabbitMQ entrega un mensaje a la vez y espera el ack), y consume con `AsyncEventingBasicConsumer` (evento `ReceivedAsync`): deserializa el body, ejecuta el lookup contra `redlist:active-plates` en Redis (ver el camino SignalR abajo — este set lo mantiene `RedListCacheService`), y hace `BasicAckAsync`/`BasicNackAsync(requeue: true)` según el resultado. Si hay match, publica `BlacklistHitSavedEvent` — ese publish sí va por CAP (camino de bajo volumen). El cierre de `IChannel`/`IConnection` (ambos `IAsyncDisposable`) se hace en `StopAsync`, no en `Dispose()`.
 - **Registro en DI:** se registra como `AddHostedService<PlateReadConsumer>()` (no `AddTransient` — no es un suscriptor de CAP).
 - **Threading:** un `IChannel` (canal) de RabbitMQ.Client no es seguro para uso concurrente entre threads; una `IConnection` compartida sí permite `CreateChannelAsync()` concurrente. Si necesitas publicar desde múltiples tareas concurrentes, comparte la conexión y da un canal propio a cada tarea.
 - **Nota para un publisher en Python (pipeline Edge, Fase 3):** al no pasar por CAP, publicar `PlateReadEvent` desde Python es un publish AMQP estándar (JSON plano a la cola `plate-read-event.raw`, con cualquier cliente como `pika`) — no hace falta replicar ningún envelope propio de CAP.
+
+### Camino SignalR (cliente, invalidación de caché desde RedLists)
+
+Un tercer camino, distinto de CAP y de RabbitMQ.Client directo: `Service.Inference/RedListCacheService.cs` es un `BackgroundService` que se conecta como **cliente de SignalR** al hub `/hubs/vehicle-lists` de `VehicleListsService.Api` (RedLists, repo separado — `C:\Ric68\RedLists`), para mantener el set de Redis `redlist:active-plates` sincronizado sin que el camino caliente de `PlateReadConsumer` tenga que tocar MySQL en cada lectura.
+
+- **Doble mecanismo:** carga completa al arrancar + suscripción en vivo a los eventos `VehicleAdded`/`VehicleRemoved`/`VehicleRecovered` del hub, MÁS un refresco delta completo cada 5 minutos como respaldo (por si se pierde algún evento durante una caída momentánea de este servicio). Al reconectar tras una caída del hub, dispara un refresco completo (`_hubConnection.Reconnected += _ => RefreshAllAsync()`) en vez de confiar en que no se perdió ningún evento mientras estuvo desconectado.
+- **Reconciliación por consulta, no por interpretación del evento:** RedLists no deduplica una placa entre filas (`vehicles`/`list_vehicles` puede tener varias filas para la misma placa) — así que tanto el refresco completo como cada evento puntual disparan la MISMA consulta: "¿sigue esta placa activa en alguna lista `list_type = 'Vehicles'` con `recovered_by_org_id = 0`?", y el resultado decide `SADD`/`SREM` en Redis. Es idempotente e independiente del orden de llegada de los eventos.
+- **Config:** `RedLists:VehicleListsHubUrl` en `appsettings.json`/user-secrets de `Service.Inference` (default `http://localhost:5247/hubs/vehicle-lists`, coincide con el `launchSettings.json` de desarrollo de `VehicleListsService.Api`) — ajustar si RedLists corre en otro host/puerto.
+- **No es fatal si RedLists no está corriendo al arrancar:** el intento de conexión al hub falla con un log de error (`"No se pudo conectar al hub de SignalR de RedLists..."`), pero el refresco delta de 5 min sigue funcionando en cuanto RedLists vuelva a estar disponible — no hace falta reiniciar `Service.Inference`.
+- **Log a buscar cuando el refresco funciona:** `"RedList cache refrescada: {Count} placas activas."` — ver §9 para el flujo completo de verificación con `tools/VerifyFase2`.
+- **Paquete:** `Microsoft.AspNetCore.SignalR.Client`, agregado a `Service.Inference.csproj` para esto (Api.Web usa el paquete equivalente de servidor, `Microsoft.AspNetCore.SignalR.StackExchangeRedis`, para su propio `AlertHub` — son roles distintos, no el mismo paquete).
 
 ## 8. Notas operativas conocidas
 
@@ -113,7 +129,7 @@ El sistema usa dos caminos de transporte de eventos, según el volumen y las gar
     dotnet tool install --global dotnet-ef --version 9.0.19
     ```
 - **Keycloak devuelve `invalid_grant: Account is not fully set up`** en un `password grant`: el usuario tiene una "required action" pendiente (típicamente porque la contraseña quedó marcada `Temporary`). Entra a `http://localhost:8080/realms/sistema-lpr/account/` e inicia sesión con ese usuario — Keycloak muestra en pantalla la acción exacta que falta completar; complétala ahí y reintenta el `password grant`.
-- **`MySqlException: Table 'SistemaLPR.casbin_rule' doesn't exist`** al arrancar `Api.Web`: `CasbinDbContext<int>.Database.EnsureCreated()` solo crea su propio esquema cuando la base de datos física tiene **cero** tablas. Como `CasbinDbContext<int>` comparte la base `SistemaLPR` con `LprDbContext`, `EnsureCreated()` debe correr **antes** de `LprDbContext.Database.Migrate()` en `Program.cs` (ya está así en el código actual). Si una base ya quedó bootstrapeada en el orden incorrecto, hay que resetear el volumen de MySQL una vez (no afecta a Redis/RabbitMQ/Keycloak):
+- **`MySqlException: Table 'SistemaLPR.casbin_rule' doesn't exist`** al arrancar `Api.Web`: `CasbinDbContext<int>.Database.EnsureCreated()` solo crea su propio esquema cuando la base de datos física tiene **cero** tablas. Como `CasbinDbContext<int>` comparte la base `SistemaLPR` con `LprDbContext`, `EnsureCreated()` debe correr **antes** de `LprDbContext.Database.Migrate()` en `Program.cs` (ya está así en el código actual). Si una base ya quedó bootstrapeada en el orden incorrecto — o si vienes de antes de Fase 3.5 (ver la nota en §4) —, hay que resetear el volumen de MySQL una vez (no afecta a Redis/RabbitMQ/Keycloak):
   ```powershell
   docker compose stop mysql
   docker compose rm -f mysql
@@ -121,17 +137,17 @@ El sistema usa dos caminos de transporte de eventos, según el volumen y las gar
   docker volume rm <nombre_del_volumen_mysql_data>
   docker compose up -d mysql
   ```
-  Después, `dotnet run --project src/Api.Web` reconstruye todo desde cero en el orden correcto.
+  Después, `dotnet run --project src/Api.Web` reconstruye todo desde cero en el orden correcto (y `tools/setup-new-machine.ps1` vuelve a aplicar `db/redlists-schema.sql`, ver §11).
 - Varios paquetes NuGet de Microsoft publican versiones que exigen `net10.0`; si `dotnet add package <algo-de-Microsoft>` falla con `NU1202`, buscar la última versión `9.0.x` explícita en vez de dejar que tome la última disponible (ver [TechnicalDocumentation.md §6](TechnicalDocumentation.md#6-paquetes-nuget-relevantes-y-notas-de-versión)).
 - `RabbitMQ.Client` no tiene `PackageReference` explícita en ningún `.csproj` — se resuelve transitivamente vía `DotNetCore.CAP.RabbitMQ`, en su serie 7.x (API async-only, ver §7). Si al compilar aparecen errores de overload en `BasicPublishAsync`/`BasicConsumeAsync`/`CreateChannelAsync` (nombres de parámetro o cantidad de argumentos), es la firma exacta de la versión de paquete resuelta — ajustar contra lo que sugiera el compilador/IntelliSense.
 
 ## 9. Herramientas de prueba: `tools/VerifyFase2` y `tools/LoadSimulator`
 
-Ninguna de las dos está registrada en `SistemaLPR.sln` (convención del repo para herramientas desechables) — se compilan y corren desde su propia carpeta.
+Ninguna de las dos está registrada en `SistemaLPR.sln` (convención del repo para herramientas desechables) — se compilan y corren desde su propia carpeta. Desde Fase 3.5, ninguna de las dos usa EF Core/`LprDbContext` para sembrar la placa de prueba — ambas siembran/limpian directo contra el esquema de RedLists con Dapper/MySqlConnector (que llegan transitivamente vía `Api.Web.csproj`, sin paquete nuevo), con el mismo patrón `EnsureRedListActiveAsync`/`RemoveFromRedListAsync` en las dos.
 
 ### `tools/VerifyFase2`
 
-Verifica a mano el camino completo de Fase 2 (no hay todavía ningún publisher real de `PlateReadEvent` fuera de este tool, `tools/LoadSimulator` y el pipeline Edge — el alta/baja real de `VehiculoRobado` sí está implementada, en `BlacklistController` (`POST`/`DELETE /api/blacklist`), ver [TechnicalDocumentation.md §5](TechnicalDocumentation.md#5-autenticación-y-autorización)).
+Verifica a mano el camino completo de Fase 2 (no hay todavía ningún publisher real de `PlateReadEvent` fuera de este tool, `tools/LoadSimulator` y el pipeline Edge; tampoco hay todavía un flujo real de alta/baja de vehículos en RedLists desde este repo — RedLists es un repo separado, este tool siembra directo contra su esquema SQL).
 
 ```powershell
 cd C:\Ric68\SistemaMunicipaLPR\tools\VerifyFase2
@@ -140,14 +156,14 @@ dotnet build
 
 Con `docker compose up -d`, `dotnet run --project src\Api.Web` y `dotnet run --project src\Service.Inference` corriendo en sus propias ventanas:
 
-1. `dotnet run -- seed` — crea la `Camara` (`Codigo = CAM-TEST-01`) y el `VehiculoRobado` de prueba (`PlateText = TEST1234`, `Estado = Activo`). Idempotente.
-2. Confirma en el log de `Service.Inference` que `BlacklistCacheService` ya cargó la placa (`"Blacklist cache refrescada: N placas activas."` con `N >= 1`) — si `Service.Inference` ya estaba corriendo antes del `seed`, reinícialo para forzar la carga inicial.
+1. `dotnet run -- seed` — crea la `Camara` (`Codigo = CAM-TEST-01`) y activa la placa de prueba (`PlateText = TEST1234`) como miembro de una lista tipo `Vehicles` en RedLists (`vehicle_lists`/`vehicles`/`list_vehicles`, creando la lista `"VerifyFase2 test list"` si no existe). Idempotente — reutiliza la lista/vehículo si ya existen y reactiva la membresía si estaba marcada como recuperada por una corrida anterior.
+2. Confirma en el log de `Service.Inference` que `RedListCacheService` ya cargó la placa (`"RedList cache refrescada: {Count} placas activas."` con `Count >= 1`) — si `Service.Inference` ya estaba corriendo antes del `seed`, reinícialo para forzar la carga inicial, espera hasta 5 min al próximo refresco delta, o confirma en el log que se conectó al hub de SignalR de RedLists (el `VehicleAdded` de este seed llega en vivo, ver §7).
 3. `dotnet run -- publish` — publica un `PlateReadEvent` con la placa de prueba (debe dar match) directo a la cola `plate-read-event.raw`. Verifica en orden:
    - Log de `PlateReadConsumer` (`Service.Inference`) reportando el match.
-   - Log de `BlacklistHitPersistenceConsumer` (`Service.Inference`) y una fila nueva en `LecturasHistoricas`/`Alertas` en SQL.
-   - Log de `AlertNotificationConsumer` (`Api.Web`) y, si tienes un cliente SignalR conectado a `/hubs/alerts` con un token válido, el mensaje `"AlertaBlacklist"`.
-4. `dotnet run -- publish-nomatch` — publica un `PlateReadEvent` con una placa que no está en la blacklist (`NOMATCH99`). Con `PlateReadLogging:OnlyLogMatches = true` (default), no debe generarse ninguna fila nueva.
-5. `dotnet run -- cleanup` — borra la `Camara`, el `VehiculoRobado` y cualquier `LecturaHistorica`/`Alerta` generada por las pruebas.
+   - Log de `BlacklistHitPersistenceConsumer` (`Service.Inference`, nombre de clase conservado — ver §11) y una fila nueva en `LecturasHistoricas`/`Alertas` en SQL (`Alertas.RedListVehicleId` apuntando al `vehicles.id` de RedLists).
+   - Log de `AlertNotificationConsumer` (`Api.Web`) y, si tienes un cliente SignalR conectado a `/hubs/alerts` con un token válido, el mensaje `"AlertaRedList"`.
+4. `dotnet run -- publish-nomatch` — publica un `PlateReadEvent` con una placa que no está activa en RedLists (`NOMATCH99`). Con `PlateReadLogging:OnlyLogMatches = true` (default), no debe generarse ninguna fila nueva.
+5. `dotnet run -- cleanup` — borra la `Camara`, la membresía/vehículo de prueba en RedLists (borrado físico — correcto aquí porque es una placa de prueba, no un vehículo real; una baja real en RedLists solo marca `recovered_by_org_id`, nunca borra la fila), y cualquier `LecturaHistorica`/`Alerta` generada por las pruebas.
 
 ### `tools/LoadSimulator`
 
@@ -158,11 +174,11 @@ cd C:\Ric68\SistemaMunicipaLPR\tools\LoadSimulator
 dotnet build
 ```
 
-- `dotnet run -- seed [--cameras N]` — siembra `N` cámaras (`CAM-SIM-0001`..`CAM-SIM-NNNN`, default 50) y una placa `SIMHIT001` como `VehiculoRobado` `Activo`. Idempotente.
+- `dotnet run -- seed [--cameras N]` — siembra `N` cámaras (`CAM-SIM-0001`..`CAM-SIM-NNNN`, default 50) y activa la placa `SIMHIT001` en RedLists (lista `"LoadSimulator test list"`), mismo mecanismo idempotente que `tools/VerifyFase2`.
 - `dotnet run -- run [--cameras N] [--rate R] [--duration S] [--match-ratio P] [--drain-seconds S]` — publica `PlateReadEvent` real directo a RabbitMQ, con `N` "cámaras" concurrentes publicando a `R` lecturas/seg cada una (defaults: `N=50`, `R=10` → ~500 eventos/seg agregados). Una fracción `P` (default `0.01`) de las lecturas de cada cámara usa la placa `SIMHIT001` para generar match real; el resto usa placas aleatorias `SIM<hex>` sin match. Sin `--duration` corre hasta Ctrl+C. Al detenerse, espera `--drain-seconds` (default `15`) con su suscriptor de latencia todavía activo antes de imprimir el resumen final, para no dejar hits en tránsito sin medir.
-- `dotnet run -- cleanup [--cameras N]` — borra las cámaras sembradas, el `VehiculoRobado` `SIMHIT001`, y cualquier `LecturaHistorica`/`Alerta` cuya `PlateText` empiece con `SIM`.
+- `dotnet run -- cleanup [--cameras N]` — borra las cámaras sembradas, la membresía/vehículo de prueba `SIMHIT001` en RedLists (borrado físico, mismo criterio que `tools/VerifyFase2`), y cualquier `LecturaHistorica`/`Alerta` cuya `PlateText` empiece con `SIM`.
 
-**Cómo mide la latencia cámara→alerta:** el tool se suscribe a `BlacklistHitSavedEvent` vía CAP (`HitLatencyConsumer`, `DefaultGroupName = "load-simulator"` — no compite con `service-inference` ni `api-web`, cada uno recibe su copia). Al publicar una lectura con la placa caliente, guarda `EventId → hora de publish`; cuando llega el `BlacklistHitSavedEvent` correspondiente, calcula la diferencia — ese número es el presupuesto de <300ms de Fase 3, medido end-to-end.
+**Cómo mide la latencia cámara→alerta:** el tool se suscribe a `BlacklistHitSavedEvent` vía CAP (`HitLatencyConsumer`, `DefaultGroupName = "load-simulator"` — no compite con `service-inference` ni `api-web`, cada uno recibe su copia). Al publicar una lectura con la placa caliente, guarda `EventId → hora de publish`; cuando llega el `BlacklistHitSavedEvent` correspondiente, calcula la diferencia — ese número es el presupuesto de <300ms de Fase 3, medido end-to-end. Este mecanismo no cambió en Fase 3.5 — `BlacklistHitSavedEvent` es uno de los eventos que se conservó (ver §7).
 
 **Por qué solo se mide latencia del 1% con match:** con `PlateReadLogging:OnlyLogMatches=true` (default), el resto de las lecturas nunca tocan SQL — para esas, lo relevante es que RabbitMQ no acumule backlog (visible en `http://localhost:15672`), una métrica de throughput distinta que hay que revisar a mano durante el `run`.
 
@@ -219,52 +235,47 @@ python -m src.main
 - **Despliegue en Jetson:** `pip install ultralytics` en un entorno genérico trae wheels de PyTorch que no aprovechan la GPU del Jetson — en Jetson real hace falta instalar primero el PyTorch específico de NVIDIA para la versión de JetPack instalada (ver comentario en `requirements.txt`).
 - **Sin verificar contra una cámara IP física ni un Jetson real todavía.** Ya está verificado end-to-end contra un video de prueba y, más recientemente, contra un stream RTSP simulado con VLC (ver [vlcTests.md](vlcTests.md)) — ambos corriendo en una máquina de desarrollo normal, sin GPU dedicada ni el hardware Jetson objetivo. Falta la verificación final contra una cámara IP física y el nodo Jetson desplegado en campo.
 
-## 11. Alimentación de la lista negra (`VehiculosRobados`)
+## 11. Integración con RedLists (Fase 3.5)
 
-Además del alta/baja manual de `BlacklistController` (uno a la vez, ver [TechnicalDocumentation.md §5](TechnicalDocumentation.md#5-autenticación-y-autorización)), la lista negra se alimenta de tres fuentes que traen los mismos datos: una API externa, archivos Excel y archivos `.txt`. Todas convergen en el mismo tipo canónico y la misma lógica de reconciliación, en `Api.Web/Services/Blacklist/`:
+Hasta Fase 3.5, este repo tenía su propio subsistema de "lista negra" (`VehiculoRobado`, `BlacklistController`, importación por API externa/Excel/`.txt` en `Api.Web/Services/Blacklist/`). Ese subsistema se **retiró por completo**: RedLists (`VehicleListsService` + `ExternalVehicleFeedService`, repo separado en `C:\Ric68\RedLists`) hace ese mismo trabajo y pasa a ser la única fuente de verdad de vehículos reportados — ver la discusión de alcance y la decisión de terminología ("blacklist"/"lista negra" → "RedList"/"lista roja" en documentación y nombres nuevos) archivada en `docs/fases.md`, sección Fase 3.5.
 
+### Qué queda en este repo
+
+- `Alertas.RedListVehicleId` (`long`, **sin FK real**) reemplaza a `Alertas.VehiculoRobadoId` — apunta a `vehicles.id` de RedLists, un esquema que este `DbContext` no administra ni migra (ver el comentario XML en `Core.Domain/Alerta.cs` y el comentario en `LprDbContext.OnModelCreating`).
+- `Service.Inference/RedListCacheService.cs` mantiene la caché de Redis sincronizada con RedLists (ver §7 — camino SignalR).
+- `Service.Inference/Consumers/BlacklistHitPersistenceConsumer.cs` (nombre de clase conservado a propósito, sigue siendo la persistencia de un "hit de blacklist" — ver §7) resuelve el `vehicles.id` de RedLists por placa al registrar cada `Alerta`.
+- Las políticas Casbin del recurso `blacklist` se quitaron del seeder — no queda ningún endpoint que las use.
+
+### Cómo corre RedLists localmente
+
+RedLists **no** se clona ni se referencia como proyecto desde este repo — es un repo hermano independiente, sin `ProjectReference` cruzado. Ambos sistemas se integran únicamente por:
+1. Una base de datos MySQL física compartida (`SistemaLPR`).
+2. El hub de SignalR de `VehicleListsService.Api` (`/hubs/vehicle-lists`), al que `Service.Inference` se conecta como cliente (§7).
+
+`tools/setup-new-machine.ps1` de este repo automatiza la parte que le corresponde a SistemaMunicipaLPR:
+- Aplica `db/redlists-schema.sql` (SQL directo — RedLists no usa migraciones de EF Core para su propio esquema: `vehicle_lists`/`vehicles`/`list_vehicles`/`adapters`/`sync_runs`/`imported_vehicles_log`) contra la base `SistemaLPR`, con `IF NOT EXISTS`/`ON DUPLICATE KEY` — idempotente, seguro de re-correr.
+- Si el repo RedLists está clonado como carpeta hermana (`..\RedLists`, mismo layout que en la máquina original), configura los `user-secrets` de `VehicleListsService.Api` y `ExternalVehicleFeedService.Api` para que apunten a `SistemaLPR` en vez de a la base `redlists` separada que usaban antes de esta fase. Si RedLists todavía no está clonado ahí, este paso se omite con un aviso — vuelve a correr el script una vez que lo clones.
+
+Para correr `VehicleListsService.Api` (necesario para que `Service.Inference` tenga algo a lo que conectarse por SignalR) y todo lo demás específico de RedLists — su propio setup, su WPF client, `ExternalVehicleFeedService` — ver `docs/Guia_Implementador_RedLists.md` **dentro del repo RedLists**, no duplicado aquí.
+
+### Cómo dar de alta/baja un vehículo de prueba sin la UI de RedLists
+
+Como este repo ya no tiene un `BlacklistController` propio para altas/bajas manuales, `tools/VerifyFase2` y `tools/LoadSimulator` (§9) siembran directo contra el esquema de RedLists con Dapper/MySqlConnector — el mismo patrón sirve para cualquier prueba manual:
+
+```sql
+-- Alta (o reactivación) de una placa en una lista tipo 'Vehicles' (RedList):
+INSERT INTO vehicle_lists (global_id, name, list_type, creating_user, last_modifying_user)
+VALUES (UUID(), 'Mi lista de prueba', 'Vehicles', 0, 0);   -- omitir si la lista ya existe
+
+INSERT INTO vehicles (plate_number) VALUES ('ABC1234');     -- omitir si la placa ya existe
+
+INSERT INTO list_vehicles (list_id, vehicle_id, recovered_by_org_id)
+VALUES (@listId, @vehicleId, 0)
+ON DUPLICATE KEY UPDATE recovered_by_org_id = 0, recovered_date = NULL, recovered_by_text = NULL;
+
+-- Baja real (RedLists nunca borra la fila, solo marca recuperado):
+UPDATE list_vehicles SET recovered_by_org_id = @orgId, recovered_date = NOW()
+WHERE list_id = @listId AND vehicle_id = @vehicleId;
 ```
-Api.Web/Services/Blacklist/
-  PlateTextNormalizer.cs           # mismo criterio de normalización que edge/src/ocr.py
-  BlacklistImportRecord.cs         # tipo canónico + resultado/resumen de importación
-  IBlacklistImportService.cs
-  BlacklistImportService.cs        # reconciliación por placa (alta/baja/actualización)
-  TabularBlacklistFileParser.cs    # lee .xlsx (ClosedXML) o .txt/.csv delimitado
-  IExternalBlacklistSource.cs
-  ExternalBlacklistApiOptions.cs   # config: BaseUrl (appsettings.json) + BearerToken (user-secrets/env)
-  ExternalBlacklistAuthHandler.cs  # DelegatingHandler: agrega "Authorization: Bearer {token}"
-  HttpExternalBlacklistSource.cs   # implementación real: GET + mapeo del JSON al tipo canónico
-  ExternalBlacklistSyncService.cs  # BackgroundService, sincroniza cada 15 min
-```
 
-**Campos del tipo canónico (`BlacklistImportRecord`):** `PlateText`, `NumeroReporte`, `FechaReporteUtc`, `BusquedaActiva` (bool — true = activo/alta, false = recuperado/baja), `ImagenPath`, `Modelo`, `Anio`, `Marca` (algunas fuentes lo llaman "Vendor"), `Color`, `Clase`, `MarcasUOtros`. Los últimos siete son opcionales — `VehiculoRobado` los guarda como columnas nullable en `VehiculosRobados`.
-
-**Reconciliación por placa (`BlacklistImportService.UpsertAsync`):** a diferencia del `POST` manual (que rechaza con 409 si la placa ya está activa), el import es idempotente — pensado para poder re-subir el mismo archivo, o uno más reciente de la misma fuente, sin generar duplicados:
-- `BusquedaActiva=true` y no hay reporte activo para esa placa → alta (publica `BlacklistEntryAddedEvent`).
-- `BusquedaActiva=true` y ya hay uno activo → actualiza los campos descriptivos que vinieron distintos (sin volver a publicar el evento — Redis ya tiene la placa).
-- `BusquedaActiva=false` y hay uno activo → baja (`Estado=Recuperado`, publica `BlacklistEntryRemovedEvent`).
-- `BusquedaActiva=false` y no hay ninguno activo → no hace nada (no es un error).
-
-**Excel/.txt — `POST /api/blacklist/import`** (multipart, campo `file`, protegido con `blacklist`/`write`): `TabularBlacklistFileParser` mapea columnas por NOMBRE de encabezado (no por posición), con una tabla de alias por campo (ej. `Anio` acepta las columnas `Anio`/`Ano`/`Año`; `Marca` acepta `Vendor`/`Marca`/`Fabricante`). El `.txt` detecta el delimitador (tab/`;`/`,`/`|`) contando cuál aparece más veces en el encabezado. Verificado contra un archivo `.txt` real delimitado por `;`. La respuesta es un resumen (`BlacklistImportSummary`) con conteos por tipo de resultado y el detalle fila por fila.
-
-**API externa — `IExternalBlacklistSource` / `HttpExternalBlacklistSource`:** un GET simple a `ExternalBlacklist:BaseUrl` (appsettings.json), autenticado con un bearer token estático que el cliente ya entregó. El endpoint regresa siempre el catálogo completo de reportes (activos e inactivos, con `busquedaActiva` explícito por registro) — no hay noción de "cambios desde X", así que `ExternalBlacklistSyncService` (`BackgroundService`, corre cada 15 min) simplemente reprocesa el arreglo completo por `IBlacklistImportService.UpsertAsync` en cada ciclo, que ya es idempotente. Forma del JSON (confirmada con un ejemplo real del cliente):
-
-```json
-[{"placa":"ABC1234","numeroReporte":"REP-2026-001","fechaReporte":"2026-08-15","busquedaActiva":true,"imagenCarro":"","modelo":"Aveo","anio":2019,"vendor":"Chevrolet","color":"Rojo","clase":"Carro","marcasUotros":""}]
-```
-
-`vendor` mapea a `Marca` en el tipo canónico, igual que en `TabularBlacklistFileParser`. Verificado end-to-end contra el endpoint real del cliente. Configuración:
-- `ExternalBlacklist:BaseUrl` — la URL real, en `appsettings.json` (no es secreto). Si en algún ambiente todavía no se tiene la URL definitiva, dejarla como `TODO-configurar-URL-real-del-endpoint-GET`: `HttpExternalBlacklistSource` detecta ese placeholder, loguea una advertencia y omite el ciclo en vez de fallar.
-- `ExternalBlacklist:BearerToken` — el token que ya entregó el cliente. **Nunca va en `appsettings.json` ni en ningún archivo versionado** (mismo criterio que evitó el incidente del `client_secret` de Keycloak en `br.bat`, ver §8). Configurarlo con:
-  ```bash
-  dotnet user-secrets init --project src/Api.Web
-  dotnet user-secrets set "ExternalBlacklist:BearerToken" "EL_TOKEN_REAL" --project src/Api.Web
-  ```
-  En otros ambientes, vía variable de entorno `ExternalBlacklist__BearerToken` (doble guion bajo — convención de `IConfiguration` para anidar secciones).
-
-**Pendiente de correr tras este cambio:** el esquema de `VehiculosRobados` creció (7 columnas nuevas nullable) — hace falta generar y aplicar la migración:
-```bash
-dotnet ef migrations add AddVehiculoRobadoDetalles --project src/Api.Web --context LprDbContext
-dotnet ef database update --project src/Api.Web --context LprDbContext
-```
-También se agregó el paquete `ClosedXML` a `Api.Web.csproj` (lectura de `.xlsx`) — su versión no se pudo verificar contra NuGet real al escribir esto; si `dotnet restore`/`dotnet build` no la encuentra, ajustar al último `0.104.x` publicado.
+Ver `EnsureRedListActiveAsync`/`RemoveFromRedListAsync` en `tools/VerifyFase2/Program.cs` para la versión completa con Dapper (incluye el lookup idempotente de lista/vehículo existentes). El borrado físico (`DELETE`, en vez del `UPDATE` de baja real de arriba) solo es correcto para datos de prueba sintéticos — así es como `cleanup` de ambos tools limpian después de correr.

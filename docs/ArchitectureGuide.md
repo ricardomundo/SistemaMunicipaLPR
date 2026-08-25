@@ -21,7 +21,7 @@ El sistema captura y procesa en tiempo real flujos de video de cámaras instalad
 1. **Invalidación inmediata event-driven** (`BlacklistEntryAddedEvent` / `BlacklistEntryRemovedEvent`) — se dispara al insertar/remover una fila en `VehiculosRobados`, propagando el cambio a Redis en segundos.
 2. **Refresco delta periódico (5 min)** — como respaldo de reconciliación, no como mecanismo primario.
 
-**Alimentación de `VehiculosRobados`:** los reportes de robo llegan por tres vías que traen los mismos datos — alta/baja manual de un operador, archivos Excel/`.txt`, y (a futuro) una API externa — todas convergiendo en un mismo servicio de reconciliación por placa antes de tocar MySQL, para que las tres disparen exactamente el mismo mecanismo de invalidación de Redis descrito arriba. Detalle en [ImplementersGuide.md §11](ImplementersGuide.md#11-alimentación-de-la-lista-negra-vehiculosrobados).
+**Alimentación de `VehiculosRobados`:** los reportes de robo llegan por tres vías que traen los mismos datos — alta/baja manual de un operador, archivos Excel/`.txt`, y (a futuro) una API externa — todas convergiendo en un mismo servicio de reconciliación por placa antes de tocar MySQL, para que las tres disparen exactamente el mismo mecanismo de invalidación de Redis descrito arriba. Detalle en [ImplementersGuide.md §11](ImplementersGuide.md#11-integración-con-redlists-fase-35).
 
 ## 3. Arquitectura de eventos y mensajería
 

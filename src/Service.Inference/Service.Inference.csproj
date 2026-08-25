@@ -14,6 +14,13 @@
          un patrón de outbox transaccional (tabla cap.Published en la misma base de datos)
          en vez de publicar directo al bus — ver ImplementersGuide.md §8. -->
     <PackageReference Include="Dapper" Version="2.1.79" />
+    <!-- Cliente de SignalR para suscribirse al hub de RedLists (VehicleListsService,
+         "/hubs/vehicle-lists") y recibir VehicleAdded/VehicleRemoved/VehicleRecovered en vivo,
+         en vez de los eventos CAP propios que este proyecto usaba antes de Fase 3.5 (ver
+         docs/fases.md). Version sin verificar contra NuGet real (sin acceso a internet desde
+         donde se escribio esto); si "dotnet restore" no la encuentra, ajustar a la ultima
+         9.0.x publicada. -->
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="9.0.19" />
     <PackageReference Include="DotNetCore.CAP" Version="8.*" />
     <PackageReference Include="DotNetCore.CAP.RabbitMQ" Version="8.*" />
     <PackageReference Include="DotNetCore.CAP.MySql" Version="8.*" />

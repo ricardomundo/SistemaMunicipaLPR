@@ -4,11 +4,13 @@ using System.Text.Json;
 using Api.Web.Data;
 using Core.Contracts;
 using Core.Domain;
+using Dapper;
 using DotNetCore.CAP;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.EntityFrameworkCore;
+using MySqlConnector;
 using RabbitMQ.Client;
 
 // Simulador de carga de Fase 3: genera tráfico sintético de PlateReadEvent contra el mismo
@@ -26,7 +28,7 @@ using RabbitMQ.Client;
 //
 // "run" mantiene N cámaras concurrentes (default 50) publicando a R lecturas/seg cada una
 // (default 10 -> 500 eventos/seg agregados). Una fracción P (default 0.01 = 1%) de las
-// lecturas de cada cámara usa la placa ya sembrada en la blacklist, para poder medir la
+// lecturas de cada cámara usa la placa ya activada en RedLists, para poder medir la
 // latencia real cámara→alerta bajo esa misma carga de fondo, en vez de solo throughput de
 // publish. Sin --duration corre hasta Ctrl+C, imprimiendo throughput y latencia cada 5s.
 //
@@ -52,7 +54,7 @@ using RabbitMQ.Client;
 // del drain se imprime el resumen final.
 
 const string connectionString = "Server=localhost;Port=3306;Database=SistemaLPR;User=root;Password=Lpr#Dev_2026!;";
-const string hotPlate = "SIMHIT001"; // placa sembrada como VehiculoRobado Activo — genera match a propósito
+const string hotPlate = "SIMHIT001"; // placa activa en RedLists (lista tipo 'Vehicles') — genera match a propósito
 
 var mode = args.Length > 0 ? args[0].ToLowerInvariant() : "help";
 var options = ParseOptions(args);
@@ -106,30 +108,16 @@ async Task SeedAsync(int cameraCount)
         created++;
     }
 
-    if (!await db.VehiculosRobados.AnyAsync(v => v.PlateText == hotPlate && v.Estado == EstadoVehiculoRobado.Activo))
-    {
-        db.VehiculosRobados.Add(new VehiculoRobado
-        {
-            PlateText = hotPlate,
-            NumeroReporte = "REPORTE-SIM-LOADTEST",
-            Estado = EstadoVehiculoRobado.Activo,
-            FechaReporteUtc = DateTime.UtcNow,
-            CreatedAtUtc = DateTime.UtcNow
-        });
-        Console.WriteLine($"VehiculoRobado '{hotPlate}' creado (Activo) — es la placa que generará matches durante 'run'.");
-    }
-    else
-    {
-        Console.WriteLine($"VehiculoRobado '{hotPlate}' ya existía como Activo, no se duplica.");
-    }
-
     await db.SaveChangesAsync();
+
+    await EnsureRedListActiveAsync(hotPlate, "LoadSimulator test list");
 
     Console.WriteLine($"Sembradas {created} cámaras nuevas ({cameraCount} en total esperadas: {CameraCodigo(1)}..{CameraCodigo(cameraCount)}).");
     Console.WriteLine();
-    Console.WriteLine("IMPORTANTE: antes de 'run', confirma en el log de Service.Inference que BlacklistCacheService");
+    Console.WriteLine("IMPORTANTE: antes de 'run', confirma en el log de Service.Inference que RedListCacheService");
     Console.WriteLine($"ya cargó '{hotPlate}' a Redis (reinicia Service.Inference si ya estaba corriendo desde antes de este seed,");
-    Console.WriteLine("o espera hasta 5 min al próximo refresh delta).");
+    Console.WriteLine("espera hasta 5 min al próximo refresh delta, o confirma en el log que se conectó al hub de SignalR");
+    Console.WriteLine("de RedLists — el VehicleAdded de este seed llega en vivo).");
 }
 
 async Task RunAsync(int cameraCount, double ratePerSecond, int? durationSeconds, double matchRatio, int drainSeconds)
@@ -335,17 +323,14 @@ async Task CleanupAsync(int cameraCount)
         .ToListAsync();
     db.LecturasHistoricas.RemoveRange(lecturas);
 
-    var vehiculo = await db.VehiculosRobados.FirstOrDefaultAsync(v => v.PlateText == hotPlate);
-    if (vehiculo is not null)
-    {
-        db.VehiculosRobados.Remove(vehiculo);
-    }
-
     var camaras = await db.Camaras.Where(c => codigos.Contains(c.Codigo)).ToListAsync();
     db.Camaras.RemoveRange(camaras);
 
     await db.SaveChangesAsync();
-    Console.WriteLine($"Datos del simulador de carga eliminados: {camaras.Count} cámaras, VehiculoRobado '{hotPlate}' " +
+
+    await RemoveFromRedListAsync(hotPlate);
+
+    Console.WriteLine($"Datos del simulador de carga eliminados: {camaras.Count} cámaras, placa '{hotPlate}' en RedLists " +
                        $"(si existía), {lecturas.Count} LecturasHistoricas y {alertas.Count} Alertas asociadas.");
 }
 
@@ -387,17 +372,90 @@ void PrintHelp()
     Console.WriteLine("Uso: dotnet run -- <modo> [opciones]");
     Console.WriteLine();
     Console.WriteLine("  seed    [--cameras N]");
-    Console.WriteLine("      Siembra N cámaras (CAM-SIM-0001..N, default 50) y la placa de prueba en blacklist.");
+    Console.WriteLine("      Siembra N cámaras (CAM-SIM-0001..N, default 50) y la placa de prueba activa en RedLists.");
     Console.WriteLine();
     Console.WriteLine("  run     [--cameras N] [--rate R] [--duration S] [--match-ratio P] [--drain-seconds S]");
     Console.WriteLine("      Publica carga sintética: N cámaras (default 50) x R lecturas/seg cada una (default 10,");
-    Console.WriteLine("      ~500/seg agregado). P es la fracción de lecturas con la placa en blacklist (default 0.01).");
+    Console.WriteLine("      ~500/seg agregado). P es la fracción de lecturas con la placa activa en RedLists (default 0.01).");
     Console.WriteLine("      Sin --duration corre hasta Ctrl+C. Imprime throughput y latencia cámara→alerta cada 5s.");
     Console.WriteLine("      Al detenerse, espera --drain-seconds (default 15) con el suscriptor todavía activo antes");
     Console.WriteLine("      de imprimir el resumen final y desconectarse — evita dejar hits en tránsito huérfanos.");
     Console.WriteLine();
     Console.WriteLine("  cleanup [--cameras N]");
-    Console.WriteLine("      Borra las cámaras, el VehiculoRobado, y toda LecturaHistorica/Alerta generada por esta prueba.");
+    Console.WriteLine("      Borra las cámaras, la placa de prueba en RedLists, y toda LecturaHistorica/Alerta generada por esta prueba.");
+}
+
+/// <summary>
+/// Da de alta (o reactiva) <paramref name="plateNumber"/> como miembro activo de una lista tipo
+/// 'Vehicles' (RedList) en el esquema de RedLists -- vehicle_lists/vehicles/list_vehicles, misma
+/// base SistemaLPR (ver Fase 3.5 en docs/fases.md). Este tool ya no usa VehiculoRobado/
+/// LprDbContext para esto desde que RedLists reemplazó el subsistema de blacklist propio; Dapper/
+/// MySqlConnector llegan transitivamente vía Api.Web.csproj, sin paquete nuevo aquí. Idempotente:
+/// reutiliza la lista/vehículo si ya existen, y reactiva la membresía si estaba marcada como
+/// recuperada por una corrida anterior.
+/// </summary>
+async Task EnsureRedListActiveAsync(string plateNumber, string listName)
+{
+    await using var connection = new MySqlConnection(connectionString);
+    await connection.OpenAsync();
+
+    var listId = await connection.QuerySingleOrDefaultAsync<long?>(
+        "SELECT id FROM vehicle_lists WHERE name = @listName AND list_type = 'Vehicles' LIMIT 1",
+        new { listName });
+    if (listId is null)
+    {
+        listId = await connection.ExecuteScalarAsync<long>(
+            @"INSERT INTO vehicle_lists (global_id, name, list_type, creating_user, last_modifying_user)
+              VALUES (UUID(), @listName, 'Vehicles', 0, 0);
+              SELECT LAST_INSERT_ID();",
+            new { listName });
+    }
+
+    var vehicleId = await connection.QuerySingleOrDefaultAsync<long?>(
+        "SELECT id FROM vehicles WHERE plate_number = @plateNumber LIMIT 1", new { plateNumber });
+    if (vehicleId is null)
+    {
+        vehicleId = await connection.ExecuteScalarAsync<long>(
+            @"INSERT INTO vehicles (plate_number) VALUES (@plateNumber);
+              SELECT LAST_INSERT_ID();",
+            new { plateNumber });
+    }
+
+    var alreadyActive = await connection.ExecuteScalarAsync<long>(
+        "SELECT COUNT(*) FROM list_vehicles WHERE list_id = @listId AND vehicle_id = @vehicleId AND recovered_by_org_id = 0",
+        new { listId, vehicleId });
+    if (alreadyActive > 0)
+    {
+        Console.WriteLine($"'{plateNumber}' ya estaba activa en RedLists (lista '{listName}'), no se duplica.");
+        return;
+    }
+
+    await connection.ExecuteAsync(
+        @"INSERT INTO list_vehicles (list_id, vehicle_id, recovered_by_org_id)
+          VALUES (@listId, @vehicleId, 0)
+          ON DUPLICATE KEY UPDATE recovered_by_org_id = 0, recovered_date = NULL, recovered_by_text = NULL;",
+        new { listId, vehicleId });
+
+    Console.WriteLine($"'{plateNumber}' agregada como activa en RedLists (lista '{listName}').");
+}
+
+/// <summary>Borrado físico de la membresía y el vehículo sintético de prueba -- correcto aquí
+/// porque es una placa de prueba (SIMHIT*), no un vehículo real (una baja real en RedLists solo
+/// marca recovered_by_org_id, nunca borra la fila).</summary>
+async Task RemoveFromRedListAsync(string plateNumber)
+{
+    await using var connection = new MySqlConnection(connectionString);
+    await connection.OpenAsync();
+
+    var vehicleId = await connection.QuerySingleOrDefaultAsync<long?>(
+        "SELECT id FROM vehicles WHERE plate_number = @plateNumber LIMIT 1", new { plateNumber });
+    if (vehicleId is null)
+    {
+        return;
+    }
+
+    await connection.ExecuteAsync("DELETE FROM list_vehicles WHERE vehicle_id = @vehicleId", new { vehicleId });
+    await connection.ExecuteAsync("DELETE FROM vehicles WHERE id = @vehicleId", new { vehicleId });
 }
 
 /// <summary>

@@ -16,7 +16,7 @@ Sistema de reconocimiento de matrículas (LPR/ANPR) y cruzamiento en tiempo real
 SistemaLPR.sln
 src/
   Core.Contracts/     Contratos de eventos compartidos (PlateReadEvent, BlacklistHitSavedEvent, ...)
-  Core.Domain/         Entidades del dominio (Camara, VehiculoRobado, LecturaHistorica, Alerta) — POCOs sin dependencia de EF Core, usados por Api.Web (EF Core) y Service.Inference (Dapper)
+  Core.Domain/         Entidades del dominio (Camara, LecturaHistorica, Alerta) — POCOs sin dependencia de EF Core, usados por Api.Web (EF Core) y Service.Inference (Dapper); Alerta.RedListVehicleId referencia vehicles.id de RedLists (repo separado, ver Fase 3.5 en docs/fases.md)
   Service.Inference/  Worker Service: consume eventos de placas, cruza contra Redis, publica alertas
   Api.Web/            Web API + SignalR Hub (AlertHub) para el Dashboard C4 y apps de patrulla
 ```
@@ -54,10 +54,10 @@ Keycloak es la única fuente de verdad de **qué rol tiene cada usuario**.
 Para proteger un endpoint:
 ```csharp
 [Authorize(Policy = "Casbin")]
-[CasbinResource("blacklist", "write")]
+[CasbinResource("camaras", "write")]
 public IActionResult Post() => ...
 ```
-Ver [`Controllers/BlacklistController.cs`](src/Api.Web/Controllers/BlacklistController.cs) como referencia completa. La matriz de permisos inicial por rol vive en [`Authorization/CasbinPolicySeeder.cs`](src/Api.Web/Authorization/CasbinPolicySeeder.cs); se re-siembra en cada arranque de forma idempotente (no pisa cambios hechos luego a mano en la tabla de políticas).
+La matriz de permisos inicial por rol vive en [`Authorization/CasbinPolicySeeder.cs`](src/Api.Web/Authorization/CasbinPolicySeeder.cs); se re-siembra en cada arranque de forma idempotente (no pisa cambios hechos luego a mano en la tabla de políticas).
 
 > Nota: este sandbox no tiene Docker disponible, así que la integración con Keycloak/MySQL no se pudo ejecutar de punta a punta aquí — verificar localmente con `docker compose up -d` seguido de `dotnet run --project src/Api.Web`.
 
@@ -66,7 +66,7 @@ Ver [`Controllers/BlacklistController.cs`](src/Api.Web/Controllers/BlacklistCont
 Entidades en `Core.Domain`, mapeadas por `Api.Web/Data/LprDbContext.cs`, todas en la misma base `SistemaLPR`:
 
 - **Camaras** — incluye `Latitude`/`Longitude` (decimal, WGS84 — mismo sistema de coordenadas que ESRI/Google Maps), tipo de instalación (arco de seguridad / avenida de alta velocidad) y velocidad máxima.
-- **VehiculosRobados** — la Lista Negra auditada; Redis solo cachea `PlateText` para el lookup O(1) del camino caliente, esta tabla es la fuente de verdad.
+- La lista de vehículos reportados (RedList) ya no vive en este repo -- la administra [RedLists](../../RedLists) (`vehicle_lists`/`vehicles`/`list_vehicles`, misma base `SistemaLPR`, mismo servidor MySQL) -- ver Fase 3.5 en [`docs/fases.md`](docs/fases.md). `Alertas.RedListVehicleId` referencia esas tablas sin FK real: RedLists las administra con su propio esquema SQL, fuera del historial de migraciones de este DbContext. Redis solo cachea `PlateText` (`redlist:active-plates`) para el lookup O(1) del camino caliente.
 - **LecturasHistoricas** — log append-only de cada lectura (match o no), con `EventId` único para deduplicar reintentos del buffer de borde, e índice compuesto (`TimestampUtc`, `PlateText`) para las consultas analíticas/forenses sobre volúmenes grandes.
 - **Alertas** — registro auditado de cada coincidencia disparada hacia C4/patrullas.
 
@@ -82,4 +82,4 @@ dotnet ef database update --project src/Api.Web
 
 - `PlateReadEvent` — **sin** imagen embebida en base64 (a diferencia del blueprint original): incluirla en el mensaje caliente de RabbitMQ arriesgaba el presupuesto de latencia de <300ms. La imagen se sube de forma asíncrona y se referencia por `ImageReference`.
 - `BlacklistHitSavedEvent` — publicado tras un match en Redis, para que un consumer aparte persista `LecturaHistorica`/`Alerta` sin bloquear el push de SignalR.
-- `BlacklistEntryAddedEvent` / `BlacklistEntryRemovedEvent` — para invalidar/actualizar Redis en segundos cuando se da de alta o de baja una placa en `VehiculosRobados`, en vez de esperar el refresco delta de 5 minutos.
+- La invalidación de la caché de Redis en segundos ya no usa eventos CAP propios de este repo (retirados en Fase 3.5) — `Service.Inference` se suscribe directo al hub de SignalR de RedLists (`VehicleAdded`/`VehicleRemoved`/`VehicleRecovered` en `/hubs/vehicle-lists`) en vez de esperar el refresco delta de 5 minutos.

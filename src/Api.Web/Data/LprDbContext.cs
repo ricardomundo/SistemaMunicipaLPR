@@ -6,7 +6,6 @@ namespace Api.Web.Data;
 public class LprDbContext(DbContextOptions<LprDbContext> options) : DbContext(options)
 {
     public DbSet<Camara> Camaras => Set<Camara>();
-    public DbSet<VehiculoRobado> VehiculosRobados => Set<VehiculoRobado>();
     public DbSet<LecturaHistorica> LecturasHistoricas => Set<LecturaHistorica>();
     public DbSet<Alerta> Alertas => Set<Alerta>();
 
@@ -22,22 +21,6 @@ public class LprDbContext(DbContextOptions<LprDbContext> options) : DbContext(op
             entity.Property(c => c.Latitude).HasColumnType("decimal(9,6)").IsRequired();
             entity.Property(c => c.Longitude).HasColumnType("decimal(9,6)").IsRequired();
             entity.Property(c => c.TipoInstalacion).HasConversion<string>().HasMaxLength(30);
-        });
-
-        modelBuilder.Entity<VehiculoRobado>(entity =>
-        {
-            entity.ToTable("VehiculosRobados");
-            entity.HasKey(v => v.Id);
-            entity.Property(v => v.PlateText).HasMaxLength(20).IsRequired();
-            entity.HasIndex(v => v.PlateText);
-            entity.Property(v => v.NumeroReporte).HasMaxLength(50).IsRequired();
-            entity.Property(v => v.Estado).HasConversion<string>().HasMaxLength(20);
-            entity.Property(v => v.ImagenPath).HasMaxLength(500);
-            entity.Property(v => v.Modelo).HasMaxLength(100);
-            entity.Property(v => v.Marca).HasMaxLength(100);
-            entity.Property(v => v.Color).HasMaxLength(50);
-            entity.Property(v => v.Clase).HasMaxLength(50);
-            entity.Property(v => v.MarcasUOtros).HasMaxLength(500);
         });
 
         modelBuilder.Entity<LecturaHistorica>(entity =>
@@ -56,7 +39,12 @@ public class LprDbContext(DbContextOptions<LprDbContext> options) : DbContext(op
             entity.HasKey(a => a.Id);
             entity.Property(a => a.Estado).HasConversion<string>().HasMaxLength(20);
             entity.HasOne<LecturaHistorica>().WithMany().HasForeignKey(a => a.LecturaHistoricaId);
-            entity.HasOne<VehiculoRobado>().WithMany().HasForeignKey(a => a.VehiculoRobadoId);
+
+            // RedListVehicleId apunta a `vehicles.id` en el esquema de RedLists (misma base
+            // SistemaLPR, ver Fase 3.5 en docs/fases.md) -- sin FK real: esa tabla la administra
+            // RedLists (VehicleListsService) con su propio esquema SQL, fuera del historial de
+            // migraciones de este DbContext.
+            entity.Property(a => a.RedListVehicleId).IsRequired();
         });
     }
 }

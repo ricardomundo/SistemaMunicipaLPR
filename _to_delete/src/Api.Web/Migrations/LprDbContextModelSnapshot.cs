@@ -44,15 +44,17 @@ namespace Api.Web.Migrations
                     b.Property<long>("LecturaHistoricaId")
                         .HasColumnType("bigint");
 
-                    b.Property<long>("RedListVehicleId")
-                        .HasColumnType("bigint");
-
                     b.Property<DateTime>("TimestampUtc")
                         .HasColumnType("datetime(6)");
+
+                    b.Property<int>("VehiculoRobadoId")
+                        .HasColumnType("int");
 
                     b.HasKey("Id");
 
                     b.HasIndex("LecturaHistoricaId");
+
+                    b.HasIndex("VehiculoRobadoId");
 
                     b.ToTable("Alertas", (string)null);
                 });
@@ -146,11 +148,83 @@ namespace Api.Web.Migrations
                     b.ToTable("LecturasHistoricas", (string)null);
                 });
 
+            modelBuilder.Entity("Core.Domain.VehiculoRobado", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("int");
+
+                    MySqlPropertyBuilderExtensions.UseMySqlIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<int?>("Anio")
+                        .HasColumnType("int");
+
+                    b.Property<string>("Clase")
+                        .HasMaxLength(50)
+                        .HasColumnType("varchar(50)");
+
+                    b.Property<string>("Color")
+                        .HasMaxLength(50)
+                        .HasColumnType("varchar(50)");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("datetime(6)");
+
+                    b.Property<string>("Estado")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("varchar(20)");
+
+                    b.Property<DateTime>("FechaReporteUtc")
+                        .HasColumnType("datetime(6)");
+
+                    b.Property<string>("ImagenPath")
+                        .HasMaxLength(500)
+                        .HasColumnType("varchar(500)");
+
+                    b.Property<string>("Marca")
+                        .HasMaxLength(100)
+                        .HasColumnType("varchar(100)");
+
+                    b.Property<string>("MarcasUOtros")
+                        .HasMaxLength(500)
+                        .HasColumnType("varchar(500)");
+
+                    b.Property<string>("Modelo")
+                        .HasMaxLength(100)
+                        .HasColumnType("varchar(100)");
+
+                    b.Property<string>("NumeroReporte")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("varchar(50)");
+
+                    b.Property<string>("PlateText")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("varchar(20)");
+
+                    b.Property<DateTime?>("RecuperadoAtUtc")
+                        .HasColumnType("datetime(6)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("PlateText");
+
+                    b.ToTable("VehiculosRobados", (string)null);
+                });
+
             modelBuilder.Entity("Core.Domain.Alerta", b =>
                 {
                     b.HasOne("Core.Domain.LecturaHistorica", null)
                         .WithMany()
                         .HasForeignKey("LecturaHistoricaId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("Core.Domain.VehiculoRobado", null)
+                        .WithMany()
+                        .HasForeignKey("VehiculoRobadoId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
                 });

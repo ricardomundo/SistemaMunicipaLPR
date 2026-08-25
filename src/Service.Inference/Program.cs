@@ -16,8 +16,6 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
 // Los suscriptores de CAP (clases con [CapSubscribe]) deben estar registrados en el
 // contenedor de DI para que CAP los descubra al arrancar.
 builder.Services.AddTransient<BlacklistHitPersistenceConsumer>();
-builder.Services.AddTransient<BlacklistEntryAddedConsumer>();
-builder.Services.AddTransient<BlacklistEntryRemovedConsumer>();
 
 // PlateReadConsumer YA NO es un suscriptor de CAP (2026-08-18) — se registra como
 // BackgroundService normal porque habla RabbitMQ.Client directo, fuera del outbox de CAP. Ver
@@ -44,9 +42,13 @@ builder.Services.AddCap(x =>
     x.DefaultGroupName = "service-inference";
 });
 
-// BlacklistCacheService mantiene el set de Redis "blacklist:active-plates" sincronizado con
-// VehiculosRobados: carga inicial al arrancar + refresco delta cada 5 min como respaldo.
-builder.Services.AddHostedService<BlacklistCacheService>();
+// RedListCacheService mantiene el set de Redis "redlist:active-plates" sincronizado con
+// RedLists (VehicleListsService, misma base SistemaLPR -- ver Fase 3.5 en docs/fases.md): carga
+// inicial + refresco delta cada 5 min como respaldo, más una suscripción en vivo al hub de
+// SignalR de RedLists para actualizaciones al segundo. Reemplaza a BlacklistCacheService y a
+// los consumers BlacklistEntryAdded/RemovedConsumer que este proyecto usaba antes de Fase 3.5
+// (dependían de VehiculosRobados + eventos CAP propios, ambos retirados).
+builder.Services.AddHostedService<RedListCacheService>();
 
 var host = builder.Build();
 host.Run();

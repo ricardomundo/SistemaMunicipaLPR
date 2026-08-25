@@ -17,8 +17,6 @@ public static class CasbinPolicySeeder
         ("SuperAdmin", "alertas", "write"),
         ("SuperAdmin", "camaras", "read"),
         ("SuperAdmin", "camaras", "write"),
-        ("SuperAdmin", "blacklist", "read"),
-        ("SuperAdmin", "blacklist", "write"),
         ("SuperAdmin", "usuarios", "read"),
         ("SuperAdmin", "usuarios", "write"),
         ("SuperAdmin", "lecturas-historicas", "read"),
@@ -27,19 +25,15 @@ public static class CasbinPolicySeeder
         ("SupervisorC4", "alertas", "write"),
         ("SupervisorC4", "camaras", "read"),
         ("SupervisorC4", "camaras", "write"),
-        ("SupervisorC4", "blacklist", "read"),
-        ("SupervisorC4", "blacklist", "write"),
         ("SupervisorC4", "usuarios", "read"),
 
         ("OperadorC4", "alertas", "read"),
         ("OperadorC4", "camaras", "read"),
-        ("OperadorC4", "blacklist", "read"),
 
         ("PatrullaMovil", "alertas", "read"),
 
         ("AuditorForense", "alertas", "read"),
         ("AuditorForense", "camaras", "read"),
-        ("AuditorForense", "blacklist", "read"),
         ("AuditorForense", "lecturas-historicas", "read"),
     ];
 

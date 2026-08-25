@@ -30,7 +30,7 @@ public class AlertNotificationConsumer : ICapSubscribe
     {
         var reading = message.Reading;
 
-        await _hubContext.Clients.All.SendAsync("AlertaBlacklist", new
+        await _hubContext.Clients.All.SendAsync("AlertaRedList", new
         {
             reading.EventId,
             reading.PlateText,
