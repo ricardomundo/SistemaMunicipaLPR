@@ -298,7 +298,13 @@ if (Test-Path $adminServiceRoot) {
     if (-not (Test-Path $adminMigrationsPath)) {
         Ok "AdminService no tiene ninguna migración todavía -- generando InitialAdminSchema"
         Push-Location $adminServiceRoot
-        dotnet ef migrations add InitialAdminSchema --project src/Admin.Infrastructure --startup-project src/Admin.Api
+        # --context AdminDbContext es obligatorio, mismo motivo que --context LprDbContext en el
+        # paso de arriba para Api.Web: Admin.Api tiene DOS DbContext (AdminDbContext y el
+        # CasbinDbContext<int> que usa Casbin.NET.Adapter.EFCore) -- sin especificar cuál,
+        # "dotnet ef" falla con "More than one DbContext was found". CasbinDbContext<int> no usa
+        # migraciones (EnsureCreated(), ver Admin.Api/Program.cs), así que nunca hace falta
+        # generarle una migración a ese.
+        dotnet ef migrations add InitialAdminSchema --project src/Admin.Infrastructure --startup-project src/Admin.Api --context AdminDbContext
         Pop-Location
     }
     Ok "migración de AdminService lista -- se aplica sola (mismo orden Casbin-primero) la primera vez que corras 'dotnet run --project src\Admin.Api'"
