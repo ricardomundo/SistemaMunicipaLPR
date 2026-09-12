@@ -1,0 +1,49 @@
+flowchart TD
+    subgraph Clientes ["Puntos de Entrada Retail y Credito"]
+        App["App Movil o Web Coppel"]
+        POS["Sistema Punto de Venta POS"]
+    end
+
+    subgraph Gateway ["Capa de Orquestacion NET 8 ASP NET Core"]
+        AIGateway["AI Gateway y Router Inteligente"]
+        CacheModule["Modulo de Caching Semantico"]
+    end
+
+    subgraph RedisLayer ["Infraestructura de Cache"]
+        Redis["Redis Semantic Cache y Rate Limiting"]
+    end
+
+    subgraph IAInference ["Motores de Inferencia"]
+        OllamaLocal["Ollama Local o Cluster GPU vLLM
+        - Sanitizacion de PII
+        - Clasificacion de intenciones
+        - Tareas Batch nocturnas"]
+        
+        DeepSeekCloud["DeepSeek API Nube
+        - Razonamiento complejo de credito
+        - Consultas de alta variabilidad
+        - Generacion de texto avanzada"]
+    end
+
+    subgraph AsyncJobs ["Procesamiento Nocturno Asincrono"]
+        Scheduler["Task Scheduler Hangfire Worker Service"]
+        MessageQueue["Cola de Mensajes RabbitMQ Kafka"]
+    end
+
+    %% Flujos en Tiempo Real
+    Clientes -->|1. Peticion HTTP REST| AIGateway
+    AIGateway <-->|2. Consulta o Almacena Embeddings| CacheModule
+    CacheModule <-->|3. Busqueda Vectorial o Exacta| Redis
+
+    %% Decisiones del Router
+    AIGateway -->|4a. Hits en Cache o Respuesta Rapida| Clientes
+    AIGateway -->|4b. Tarea Privada Sanitizacion o Modelo Ligero| OllamaLocal
+    AIGateway -->|4c. Razonamiento Complejo o Prompt Sanitizado| DeepSeekCloud
+    
+    OllamaLocal -->|5a. Respuesta Sanitizada o Clasificada| AIGateway
+    DeepSeekCloud -->|5b. Respuesta Generada| AIGateway
+
+    %% Flujos Nocturnos y Asincronos
+    AIGateway -.->|6. Encola tarea diferida| MessageQueue
+    Scheduler -->|7. Activa proceso nocturno| MessageQueue
+    MessageQueue -->|8. Consume tareas en Lote Batch| OllamaLocal
