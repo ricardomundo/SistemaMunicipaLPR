@@ -1,0 +1,111 @@
+# Save as .github/workflows/dotnet-ci.yml in your repository
+name: .NET build, test & CVE scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: "0 6 * * 1"   # weekly re-scan: new CVEs appear even when your code doesn't change
+
+permissions:
+  contents: read
+  security-events: write   # lets Trivy upload results to the repo's Security tab
+
+jobs:
+  build-test-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"      # match your project's TargetFramework
+
+      # ---------- Compile ----------
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      # ---------- Run ----------
+      - name: Test
+        run: dotnet test --no-build --configuration Release --verbosity normal
+
+      # Optional smoke test: start the app and make sure it doesn't crash on startup.
+      # Replace the path with your project. For a web API, you could curl a health endpoint instead.
+      # - name: Smoke run
+      #   run: timeout 20s dotnet run --no-build -c Release --project src/MyApp/MyApp.csproj || [ $? -eq 124 ]
+
+      # ---------- CVE scan #1: built into the .NET SDK (GitHub Advisory Database) ----------
+      - name: Check NuGet packages for known vulnerabilities
+        run: |
+          dotnet list package --vulnerable --include-transitive 2>&1 | tee vuln-report.txt
+          if grep -q -i "has the following vulnerable packages" vuln-report.txt; then
+            echo "::error::Vulnerable NuGet packages found (see log above)"
+            exit 1
+          fi
+
+      # ---------- CVE scan #2: Trivy (open source, Aqua Security) ----------
+      # IMPORTANT: Trivy's action tags were hijacked in March 2026 (CVE-2026-33634).
+      # Use v0.35.0 or later, and ideally replace the tag with the release's full commit SHA.
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-filesystem
+
+      # ---------- Container: build & scan the image ----------
+      # Adjust the Dockerfile path and context if yours isn't at the repo root.
+      # Repeat these three steps (with a different tag/output) for each image you build.
+      - name: Build container image
+        run: docker build -t myapp:${{ github.sha }} -f Dockerfile .
+
+      # Gate: fail the workflow on CRITICAL/HIGH CVEs that have a fix available
+      - name: Trivy image scan (fail on fixable CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          scan-type: image
+          image-ref: myapp:${{ github.sha }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+
+      # Report: full results (OS packages + .NET dependencies inside the image) to the Security tab
+      - name: Trivy image scan (SARIF report)
+        uses: aquasecurity/trivy-action@v0.35.0
+        if: always()
+        with:
+          scan-type: image
+          image-ref: myapp:${{ github.sha }}
+          scanners: vuln
+          format: sarif
+          output: trivy-image-results.sarif
+
+      - name: Upload image scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-container-image
+
+      # Push to a registry only after the scan passes, e.g.:
+      # - uses: docker/login-action@v3 ...
+      # - run: docker push <registry>/myapp:${{ github.sha }}
